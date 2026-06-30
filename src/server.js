@@ -7,6 +7,7 @@ import { nanoid } from "nanoid"
 const app = express()
 const PORT = Number(process.env.PORT || 8080)
 const TOKEN = process.env.EXTRACTOR_TOKEN || ""
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "")
 const MAX_EXTRACT_MS = Number(process.env.MAX_EXTRACT_MS || 25000)
 
 app.use(cors({ origin: "*" }))
@@ -22,15 +23,54 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "mgresv-extractor",
-    engine: "playwright chromium + platform adapters + metadata/dom/json extraction",
+    engine: "playwright chromium + strict photo adapters + proxied thumbnails + clean slides",
     supports: [
       "tiktok photo/video detection",
       "instagram post/reel detection",
-      "pinterest photo detection",
-      "generic metadata thumbnail",
-      "dom image/video extraction"
+      "visible DOM image extraction",
+      "explicit TikTok imagePost parser",
+      "proxied thumbnail/image URLs",
+      "noise filtering for icons/logo/static images"
     ]
   })
+})
+
+app.get("/proxy-image", async (req, res) => {
+  try {
+    const target = normalizeUrl(req.query?.url)
+
+    if (!target) {
+      return res.status(400).send("Invalid image URL")
+    }
+
+    const response = await fetch(target, {
+      headers: {
+        accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9,id;q=0.8",
+        referer: guessReferer(target),
+        "user-agent": browserUserAgent()
+      },
+      redirect: "follow"
+    })
+
+    if (!response.ok) {
+      return res.status(response.status).send("Image fetch failed")
+    }
+
+    const contentType = response.headers.get("content-type") || "image/jpeg"
+    const buffer = Buffer.from(await response.arrayBuffer())
+
+    if (!contentType.toLowerCase().includes("image") || buffer.length < 200) {
+      return res.status(422).send("Not a valid image")
+    }
+
+    res.setHeader("content-type", contentType)
+    res.setHeader("cache-control", "public, max-age=3600")
+    res.setHeader("access-control-allow-origin", "*")
+    return res.send(buffer)
+  } catch (error) {
+    return res.status(422).send("Proxy image failed")
+  }
 })
 
 app.post("/extract", async (req, res) => {
@@ -45,7 +85,8 @@ app.post("/extract", async (req, res) => {
       return res.status(400).json({ ok: false, error: "URL tidak valid." })
     }
 
-    const result = await withTimeout(extract(url), MAX_EXTRACT_MS, "Extractor timeout.")
+    const baseUrl = getPublicBase(req)
+    const result = await withTimeout(extract(url, baseUrl), MAX_EXTRACT_MS, "Extractor timeout.")
 
     return res.json({
       ok: true,
@@ -61,7 +102,7 @@ app.post("/extract", async (req, res) => {
   }
 })
 
-async function extract(inputUrl) {
+async function extract(inputUrl, baseUrl) {
   const browser = await getBrowser()
   const context = await browser.newContext({
     viewport: { width: 1365, height: 900 },
@@ -74,8 +115,22 @@ async function extract(inputUrl) {
   })
 
   const page = await context.newPage()
+  const networkImages = []
 
-  // Keep the page lighter but DO NOT block images; we need image URLs.
+  page.on("response", async (response) => {
+    try {
+      const url = response.url()
+      const headers = response.headers()
+      const type = String(headers["content-type"] || "").toLowerCase()
+
+      if (type.includes("image") && isLikelyImageUrl(url)) {
+        networkImages.push(url)
+      }
+    } catch {
+      // ignore
+    }
+  })
+
   await page.route("**/*", async (route) => {
     const type = route.request().resourceType()
     const url = route.request().url()
@@ -93,14 +148,12 @@ async function extract(inputUrl) {
 
   try {
     await page.goto(inputUrl, { waitUntil: "domcontentloaded", timeout: Math.min(MAX_EXTRACT_MS, 20000) })
-    await page.waitForTimeout(3500).catch(() => {})
+    await page.waitForTimeout(4500).catch(() => {})
+    await dismissCommonDialogs(page)
 
     const finalUrl = page.url() || inputUrl
     const platform = detectPlatform(finalUrl || inputUrl)
     const urlKind = detectKindFromUrl(finalUrl || inputUrl, platform)
-
-    // Try clicking accept cookies / close simple dialogs without hard dependence.
-    await dismissCommonDialogs(page)
 
     const data = await page.evaluate(() => {
       const metas = {}
@@ -125,7 +178,9 @@ async function extract(inputUrl) {
         width: img.naturalWidth || img.width || 0,
         height: img.naturalHeight || img.height || 0,
         rectWidth: Math.round(img.getBoundingClientRect().width || 0),
-        rectHeight: Math.round(img.getBoundingClientRect().height || 0)
+        rectHeight: Math.round(img.getBoundingClientRect().height || 0),
+        top: Math.round(img.getBoundingClientRect().top || 0),
+        left: Math.round(img.getBoundingClientRect().left || 0)
       }))
 
       const videos = Array.from(document.querySelectorAll("video, video source, source")).map((node) => ({
@@ -147,72 +202,73 @@ async function extract(inputUrl) {
     })
 
     const meta = normalizeMetadata(data.metas || {})
-    const jsonUrls = extractUrlsFromScripts(data.scripts || [], platform)
-    const domImageUrls = extractDomImageUrls(data.images || [], platform)
+    const explicitJsonImages = extractExplicitImagesFromScripts(data.scripts || [], platform)
+    const visibleDomImages = extractVisibleDomImages(data.images || [], platform)
+    const validNetworkImages = filterByPlatform(unique(networkImages.map(cleanMediaUrl).filter(Boolean)), platform)
     const videoUrls = extractVideoUrls(data.videos || [], meta)
 
-    let slides = []
     let kind = urlKind || "unknown"
+    let rawSlides = []
 
     if (platform === "tiktok") {
-      const tiktokUrls = unique([
-        ...jsonUrls,
-        ...domImageUrls,
-        ...(meta.image ? [meta.image] : [])
-      ]).filter((item) => isValidPlatformImage(item, platform))
-
-      if (urlKind === "photo" || tiktokUrls.length > 1) {
+      if (urlKind === "photo") {
+        // Strict priority: real post images from JSON > visible images > network images > meta image.
+        rawSlides = firstNonEmpty([
+          explicitJsonImages,
+          visibleDomImages,
+          validNetworkImages,
+          meta.image ? [meta.image] : []
+        ])
         kind = "photo"
-        slides = toSlides(tiktokUrls, "tiktok")
-      } else if (videoUrls.length || meta.video) {
+      } else if (urlKind === "video" || videoUrls.length || meta.video) {
         kind = "video"
       }
     } else if (platform === "instagram") {
-      const instagramUrls = unique([
-        ...jsonUrls,
-        ...domImageUrls,
-        ...(meta.image ? [meta.image] : [])
-      ]).filter((item) => isValidPlatformImage(item, platform))
-
-      if (urlKind === "photo" || instagramUrls.length) {
-        kind = meta.video && urlKind !== "photo" && instagramUrls.length <= 1 ? "video" : "photo"
-        if (kind === "photo") slides = toSlides(instagramUrls, "instagram")
-      } else if (videoUrls.length || meta.video) {
+      if (urlKind === "photo") {
+        // Avoid regex-script noise. Use visible rendered images first, then metadata.
+        rawSlides = firstNonEmpty([
+          visibleDomImages,
+          meta.image ? [meta.image] : [],
+          explicitJsonImages
+        ])
+        kind = meta.video && rawSlides.length <= 1 ? "video" : "photo"
+      } else if (urlKind === "video" || videoUrls.length || meta.video) {
         kind = "video"
       }
     } else if (platform === "pinterest") {
-      const urls = unique([...jsonUrls, ...domImageUrls, ...(meta.image ? [meta.image] : [])])
-        .filter((item) => isLikelyImageUrl(item))
+      rawSlides = firstNonEmpty([
+        visibleDomImages,
+        meta.image ? [meta.image] : [],
+        explicitJsonImages
+      ])
       kind = "photo"
-      slides = toSlides(urls, "pinterest")
     } else {
-      const urls = unique([...jsonUrls, ...domImageUrls, ...(meta.image ? [meta.image] : [])])
-        .filter((item) => isLikelyImageUrl(item))
+      rawSlides = firstNonEmpty([
+        visibleDomImages,
+        meta.image ? [meta.image] : [],
+        explicitJsonImages
+      ])
 
-      if (urlKind === "photo" || urls.length > 1) {
-        kind = "photo"
-        slides = toSlides(urls, platform || "media")
-      } else if (videoUrls.length || meta.video || urlKind === "video") {
-        kind = "video"
-      } else if (urlKind === "audio") {
-        kind = "audio"
-      }
+      if (urlKind === "photo" || rawSlides.length > 1) kind = "photo"
+      else if (urlKind === "audio") kind = "audio"
+      else if (urlKind === "video" || videoUrls.length || meta.video) kind = "video"
+      else kind = rawSlides.length ? "photo" : "video"
     }
 
-    if (kind === "unknown") {
-      if (videoUrls.length || meta.video) kind = "video"
-      else if (slides.length) kind = "photo"
-      else kind = "video"
-    }
-
-    const thumbnail = chooseThumbnail({
+    const originalSlides = toSlides(rawSlides, platform)
+    const proxiedSlides = proxifySlides(originalSlides, baseUrl)
+    const originalThumbnail = chooseThumbnail({
       platform,
       kind,
       metaImage: meta.image,
-      slides,
-      domImages: domImageUrls,
-      fallback: true
+      slides: originalSlides,
+      domImages: visibleDomImages,
+      fallback: false
     })
+
+    const thumbnail = originalThumbnail
+      ? proxyUrl(originalThumbnail, baseUrl)
+      : `/fallbacks/${platform || "media"}-${kind || "media"}.svg`
 
     const title = cleanTitle(meta.title || data.title || `${prettyPlatform(platform)} media`)
 
@@ -226,12 +282,17 @@ async function extract(inputUrl) {
       source: finalUrl,
       originalSource: inputUrl,
       resolvedSource: finalUrl,
-      slides,
-      videoUrls: videoUrls.slice(0, 5),
+      slides: proxiedSlides,
+      rawDebug: {
+        explicitJsonCount: explicitJsonImages.length,
+        visibleDomCount: visibleDomImages.length,
+        networkImageCount: validNetworkImages.length,
+        originalSlideCount: originalSlides.length
+      },
       meta: {
         ogType: meta.type,
         hasVideo: Boolean(meta.video || videoUrls.length),
-        hasImage: Boolean(meta.image || slides.length)
+        hasImage: Boolean(meta.image || originalSlides.length)
       }
     }
   } catch (error) {
@@ -257,24 +318,124 @@ async function getBrowser() {
 }
 
 async function dismissCommonDialogs(page) {
-  const labels = [
-    "Accept all",
-    "Accept",
-    "Allow all",
-    "Allow",
-    "Not now",
-    "Close",
-    "Maybe later"
-  ]
+  const labels = ["Accept all", "Accept", "Allow all", "Allow", "Not now", "Close", "Maybe later"]
 
   for (const label of labels) {
     try {
-      await page.getByText(label, { exact: false }).first().click({ timeout: 800 })
-      await page.waitForTimeout(300)
+      await page.getByText(label, { exact: false }).first().click({ timeout: 700 })
+      await page.waitForTimeout(250)
     } catch {
       // ignore
     }
   }
+}
+
+function extractExplicitImagesFromScripts(scripts, platform) {
+  const candidates = []
+
+  for (const script of scripts) {
+    const text = String(script.text || "")
+
+    if (script.id && ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE", "__NEXT_DATA__"].includes(script.id)) {
+      try {
+        const parsed = JSON.parse(decodeHtml(text).trim())
+        walkJsonForExplicitImages(parsed, candidates, platform)
+      } catch {
+        // ignore
+      }
+    }
+
+    if (platform === "tiktok" && text.includes("imagePost")) {
+      const normalized = normalizeEscapedText(text)
+      const matches = normalized.matchAll(/https:\/\/[^"'<>\\\s]+(?:tiktokcdn|muscdn|byteimg)[^"'<>\\\s]+(?:\.jpg|\.jpeg|\.webp|\.png|image)[^"'<>\\\s]*/gi)
+      for (const match of matches) {
+        if (match?.[0]) candidates.push(match[0])
+      }
+    }
+
+    if (platform === "instagram" && /display_url|thumbnail_src|carousel_media/.test(text)) {
+      const normalized = normalizeEscapedText(text)
+      const matches = normalized.matchAll(/https:\/\/[^"'<>\\\s]+(?:scontent|cdninstagram|fbcdn)[^"'<>\\\s]+\.(?:jpg|jpeg|webp|png)(?:\?[^"'<>\\\s]*)?/gi)
+      for (const match of matches) {
+        if (match?.[0]) candidates.push(match[0])
+      }
+    }
+  }
+
+  return filterByPlatform(unique(candidates.map(cleanMediaUrl).filter(Boolean)), platform)
+}
+
+function walkJsonForExplicitImages(node, output, platform, key = "") {
+  if (!node) return
+
+  if (typeof node === "string") {
+    const cleaned = cleanMediaUrl(node)
+    if (cleaned && isValidPlatformImage(cleaned, platform)) output.push(cleaned)
+    return
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) walkJsonForExplicitImages(item, output, platform, key)
+    return
+  }
+
+  if (typeof node === "object") {
+    if (platform === "tiktok" && node.imagePost?.images && Array.isArray(node.imagePost.images)) {
+      for (const image of node.imagePost.images) {
+        const imageUrl = image?.imageURL || image?.imageUrl || image?.image_url || {}
+        const list = imageUrl.urlList || imageUrl.url_list || []
+        if (Array.isArray(list) && list[0]) output.push(list[0])
+      }
+      return
+    }
+
+    if (platform === "instagram") {
+      if (typeof node.display_url === "string") output.push(node.display_url)
+      if (typeof node.thumbnail_src === "string") output.push(node.thumbnail_src)
+      if (node.image_versions2?.candidates?.[0]?.url) output.push(node.image_versions2.candidates[0].url)
+    }
+
+    for (const [childKey, childValue] of Object.entries(node)) {
+      if (/avatar|profile|icon|logo/i.test(childKey)) continue
+      walkJsonForExplicitImages(childValue, output, platform, childKey)
+    }
+  }
+}
+
+function extractVisibleDomImages(images, platform) {
+  const candidates = []
+
+  for (const image of images) {
+    const width = Math.max(Number(image.width || 0), Number(image.rectWidth || 0))
+    const height = Math.max(Number(image.height || 0), Number(image.rectHeight || 0))
+    const area = width * height
+    const urls = [image.src, ...parseSrcset(image.srcset)]
+      .map(cleanMediaUrl)
+      .filter(Boolean)
+
+    // Strict filter: keep content-sized images, not icons.
+    const sizeOk = width >= 160 && height >= 160 && area >= 40000
+
+    for (const url of urls) {
+      if (!sizeOk && !isPlatformCdn(url, platform)) continue
+      candidates.push(url)
+    }
+  }
+
+  return filterByPlatform(unique(candidates), platform)
+}
+
+function extractVideoUrls(videos, meta) {
+  const urls = []
+
+  if (meta?.video) urls.push(meta.video)
+
+  for (const video of videos) {
+    if (video.src) urls.push(video.src)
+    if (video.poster) urls.push(video.poster)
+  }
+
+  return unique(urls.map(cleanMediaUrl).filter(Boolean))
 }
 
 function normalizeMetadata(metas) {
@@ -294,101 +455,11 @@ function normalizeMetadata(metas) {
   }
 }
 
-function extractUrlsFromScripts(scripts, platform) {
-  const candidates = []
-
-  for (const script of scripts) {
-    const text = normalizeEscapedText(script.text || "")
-
-    if (script.id && ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE", "__NEXT_DATA__"].includes(script.id)) {
-      try {
-        const parsed = JSON.parse(decodeHtml(script.text || "").trim())
-        walkJsonForUrls(parsed, candidates)
-      } catch {
-        // continue regex fallback
-      }
-    }
-
-    // Generic JSON URL extraction
-    const regexes = [
-      /https:\/\/[^"'<>\\\s]+\.(?:jpg|jpeg|png|webp|avif)(?:\?[^"'<>\\\s]*)?/gi,
-      /https:\/\/[^"'<>\\\s]+(?:image|photo|scontent|tiktokcdn|cdninstagram|fbcdn|pinimg)[^"'<>\\\s]*/gi
-    ]
-
-    for (const regex of regexes) {
-      for (const match of text.matchAll(regex)) {
-        if (match?.[0]) candidates.push(match[0])
-      }
-    }
+function firstNonEmpty(groups) {
+  for (const group of groups) {
+    if (Array.isArray(group) && group.length) return group
   }
-
-  return filterByPlatform(unique(candidates.map(cleanMediaUrl).filter(Boolean)), platform)
-}
-
-function walkJsonForUrls(node, output, key = "") {
-  if (!node) return
-
-  if (typeof node === "string") {
-    const cleaned = cleanMediaUrl(node)
-    if (cleaned && (isLikelyImageUrl(cleaned) || /image|photo|urlList|url_list/i.test(key))) {
-      output.push(cleaned)
-    }
-    return
-  }
-
-  if (Array.isArray(node)) {
-    for (const item of node) walkJsonForUrls(item, output, key)
-    return
-  }
-
-  if (typeof node === "object") {
-    // explicit TikTok imagePost path
-    if (node.imagePost?.images && Array.isArray(node.imagePost.images)) {
-      for (const image of node.imagePost.images) {
-        const imageUrl = image?.imageURL || image?.imageUrl || image?.image_url || {}
-        const list = imageUrl.urlList || imageUrl.url_list || []
-        if (Array.isArray(list)) {
-          for (const item of list) walkJsonForUrls(item, output, "imagePost")
-        }
-      }
-    }
-
-    for (const [childKey, childValue] of Object.entries(node)) {
-      walkJsonForUrls(childValue, output, childKey)
-    }
-  }
-}
-
-function extractDomImageUrls(images, platform) {
-  const candidates = []
-
-  for (const image of images) {
-    const urls = [image.src, ...parseSrcset(image.srcset)]
-      .map(cleanMediaUrl)
-      .filter(Boolean)
-
-    const sizeOk = Math.max(Number(image.width || 0), Number(image.rectWidth || 0)) >= 120 &&
-      Math.max(Number(image.height || 0), Number(image.rectHeight || 0)) >= 120
-
-    for (const url of urls) {
-      if (sizeOk || isPlatformCdn(url, platform)) candidates.push(url)
-    }
-  }
-
-  return filterByPlatform(unique(candidates), platform)
-}
-
-function extractVideoUrls(videos, meta) {
-  const urls = []
-
-  if (meta?.video) urls.push(meta.video)
-
-  for (const video of videos) {
-    if (video.src) urls.push(video.src)
-    if (video.poster) urls.push(video.poster)
-  }
-
-  return unique(urls.map(cleanMediaUrl).filter(Boolean))
+  return []
 }
 
 function filterByPlatform(urls, platform) {
@@ -414,7 +485,7 @@ function filterByPlatform(urls, platform) {
     return urls.filter((item) => /pinimg|pinterest/.test(item.toLowerCase()))
   }
 
-  return urls
+  return urls.filter((item) => !/avatar|profile|sprite|favicon|logo|icon/.test(item.toLowerCase()))
 }
 
 function isValidPlatformImage(url, platform) {
@@ -439,7 +510,7 @@ function isPlatformCdn(url, platform) {
 function toSlides(urls, platform) {
   return unique(urls)
     .filter((item) => isValidPlatformImage(item, platform))
-    .slice(0, 30)
+    .slice(0, 12)
     .map((item, index) => ({
       index,
       type: "photo",
@@ -449,11 +520,27 @@ function toSlides(urls, platform) {
     }))
 }
 
+function proxifySlides(slides, baseUrl) {
+  return slides.map((slide, index) => ({
+    ...slide,
+    index,
+    originalUrl: slide.url,
+    url: proxyUrl(slide.url, baseUrl),
+    thumbnail: proxyUrl(slide.thumbnail || slide.url, baseUrl)
+  }))
+}
+
+function proxyUrl(url, baseUrl) {
+  const clean = cleanMediaUrl(url)
+  if (!clean) return ""
+  return `${baseUrl}/proxy-image?url=${encodeURIComponent(clean)}`
+}
+
 function chooseThumbnail({ platform, kind, metaImage, slides, domImages, fallback }) {
   const candidates = [
-    metaImage,
     slides?.[0]?.thumbnail,
     slides?.[0]?.url,
+    metaImage,
     ...(domImages || [])
   ].filter(Boolean)
 
@@ -533,7 +620,6 @@ function prettyPlatform(value) {
     x: "X/Twitter",
     other: "Media"
   }
-
   return map[value] || String(value || "Media")
 }
 
@@ -589,19 +675,38 @@ function decodeHtml(value) {
 }
 
 function unique(items) {
-  return [...new Set(items.filter(Boolean))]
+  return [...new Set(items.filter(Boolean).map(String))]
 }
 
 function normalizeUrl(value) {
   try {
     const raw = String(value || "").trim()
     const parsed = new URL(raw)
-
     if (!["http:", "https:"].includes(parsed.protocol)) return ""
     return parsed.toString()
   } catch {
     return ""
   }
+}
+
+function guessReferer(target) {
+  try {
+    const host = new URL(target).hostname.toLowerCase()
+    if (host.includes("tiktokcdn") || host.includes("muscdn") || host.includes("byteimg")) return "https://www.tiktok.com/"
+    if (host.includes("cdninstagram") || host.includes("fbcdn") || host.includes("scontent")) return "https://www.instagram.com/"
+    if (host.includes("pinimg")) return "https://www.pinterest.com/"
+    return "https://www.google.com/"
+  } catch {
+    return "https://www.google.com/"
+  }
+}
+
+function getPublicBase(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL
+
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http"
+  const host = req.headers["x-forwarded-host"] || req.headers.host
+  return `${proto}://${host}`.replace(/\/$/, "")
 }
 
 function checkAuth(req) {
@@ -611,9 +716,7 @@ function checkAuth(req) {
   const xToken = req.headers["x-extractor-token"] || ""
 
   if (auth !== `Bearer ${TOKEN}` && xToken !== TOKEN) {
-    const error = new Error("Unauthorized extractor token.")
-    error.status = 401
-    throw error
+    throw new Error("Unauthorized extractor token.")
   }
 }
 
