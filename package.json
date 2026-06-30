@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "6.0.1-extractor-proxy-clean-slides",
+  "version": "6.0.2-materialized-images",
   "type": "module",
   "private": true,
   "scripts": {

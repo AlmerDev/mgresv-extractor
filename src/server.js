@@ -3,12 +3,16 @@ import cors from "cors"
 import helmet from "helmet"
 import { chromium } from "playwright"
 import { nanoid } from "nanoid"
+import { mkdirSync, writeFileSync, statSync, rmSync, readdirSync } from "node:fs"
+import { join, basename } from "node:path"
 
 const app = express()
 const PORT = Number(process.env.PORT || 8080)
 const TOKEN = process.env.EXTRACTOR_TOKEN || ""
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "")
 const MAX_EXTRACT_MS = Number(process.env.MAX_EXTRACT_MS || 25000)
+const MEDIA_DIR = process.env.MEDIA_DIR || "/tmp/mgresv-extractor-media"
+mkdirSync(MEDIA_DIR, { recursive: true })
 
 app.use(cors({ origin: "*" }))
 app.use(helmet({
@@ -16,6 +20,13 @@ app.use(helmet({
   contentSecurityPolicy: false
 }))
 app.use(express.json({ limit: "1mb" }))
+app.use("/media", express.static(MEDIA_DIR, {
+  maxAge: "1h",
+  setHeaders: (res) => {
+    res.setHeader("access-control-allow-origin", "*")
+    res.setHeader("cache-control", "public, max-age=3600")
+  }
+}))
 
 let browserPromise = null
 
@@ -23,13 +34,13 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "mgresv-extractor",
-    engine: "playwright chromium + strict photo adapters + proxied thumbnails + clean slides",
+    engine: "playwright chromium + strict photo adapters + materialized local image files + clean slides",
     supports: [
       "tiktok photo/video detection",
       "instagram post/reel detection",
       "visible DOM image extraction",
       "explicit TikTok imagePost parser",
-      "proxied thumbnail/image URLs",
+      "materialized thumbnail/image URLs",
       "noise filtering for icons/logo/static images"
     ]
   })
@@ -86,6 +97,7 @@ app.post("/extract", async (req, res) => {
     }
 
     const baseUrl = getPublicBase(req)
+    cleanupOldMedia()
     const result = await withTimeout(extract(url, baseUrl), MAX_EXTRACT_MS, "Extractor timeout.")
 
     return res.json({
@@ -256,7 +268,14 @@ async function extract(inputUrl, baseUrl) {
     }
 
     const originalSlides = toSlides(rawSlides, platform)
-    const proxiedSlides = proxifySlides(originalSlides, baseUrl)
+    const materializedSlides = await materializeSlides({
+      slides: originalSlides,
+      context,
+      platform,
+      referer: finalUrl,
+      baseUrl
+    })
+
     const originalThumbnail = chooseThumbnail({
       platform,
       kind,
@@ -266,9 +285,17 @@ async function extract(inputUrl, baseUrl) {
       fallback: false
     })
 
-    const thumbnail = originalThumbnail
-      ? proxyUrl(originalThumbnail, baseUrl)
-      : `/fallbacks/${platform || "media"}-${kind || "media"}.svg`
+    const materializedThumbnail = materializedSlides[0]?.thumbnail ||
+      (originalThumbnail ? await materializeSingleImage({
+        url: originalThumbnail,
+        context,
+        platform,
+        referer: finalUrl,
+        baseUrl,
+        namePrefix: "thumb"
+      }) : "")
+
+    const thumbnail = materializedThumbnail || `/fallbacks/${platform || "media"}-${kind || "media"}.svg`
 
     const title = cleanTitle(meta.title || data.title || `${prettyPlatform(platform)} media`)
 
@@ -282,7 +309,7 @@ async function extract(inputUrl, baseUrl) {
       source: finalUrl,
       originalSource: inputUrl,
       resolvedSource: finalUrl,
-      slides: proxiedSlides,
+      slides: materializedSlides.length ? materializedSlides : proxifySlides(originalSlides, baseUrl),
       rawDebug: {
         explicitJsonCount: explicitJsonImages.length,
         visibleDomCount: visibleDomImages.length,
@@ -519,6 +546,136 @@ function toSlides(urls, platform) {
       filename: `${platform || "slide"}-${index + 1}.${guessImageExt(item)}`
     }))
 }
+
+async function materializeSlides({ slides, context, platform, referer, baseUrl }) {
+  const result = []
+
+  for (const slide of slides.slice(0, 12)) {
+    const localUrl = await materializeSingleImage({
+      url: slide.url,
+      context,
+      platform,
+      referer,
+      baseUrl,
+      namePrefix: `slide-${slide.index + 1}`
+    })
+
+    if (!localUrl) continue
+
+    result.push({
+      ...slide,
+      index: result.length,
+      originalUrl: slide.url,
+      url: localUrl,
+      thumbnail: localUrl
+    })
+  }
+
+  return result
+}
+
+async function materializeSingleImage({ url, context, platform, referer, baseUrl, namePrefix = "image" }) {
+  const clean = cleanMediaUrl(url)
+  if (!clean) return ""
+
+  const attempts = [
+    {
+      referer,
+      headers: imageFetchHeaders(platform, referer)
+    },
+    {
+      referer: guessReferer(clean),
+      headers: imageFetchHeaders(platform, guessReferer(clean))
+    }
+  ]
+
+  for (const attempt of attempts) {
+    try {
+      const response = await context.request.get(clean, {
+        headers: attempt.headers,
+        timeout: 12000
+      })
+
+      if (!response.ok()) continue
+
+      const contentType = String(response.headers()["content-type"] || "").toLowerCase()
+      const body = await response.body()
+
+      if (!contentType.includes("image")) continue
+      if (!body || body.length < 800) continue
+
+      const ext = extFromContentType(contentType) || guessImageExt(clean)
+      const filename = `${Date.now()}-${nanoid(8)}-${sanitizeFilePart(namePrefix)}.${ext}`
+      const filepath = join(MEDIA_DIR, filename)
+
+      writeFileSync(filepath, body)
+
+      try {
+        if (statSync(filepath).size < 800) {
+          rmSync(filepath, { force: true })
+          continue
+        }
+      } catch {
+        continue
+      }
+
+      return `${baseUrl}/media/${encodeURIComponent(filename)}`
+    } catch {
+      // try next attempt
+    }
+  }
+
+  return ""
+}
+
+function imageFetchHeaders(platform, referer) {
+  return {
+    accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9,id;q=0.8",
+    referer: referer || platformReferer(platform),
+    "user-agent": browserUserAgent(),
+    "sec-fetch-dest": "image",
+    "sec-fetch-mode": "no-cors",
+    "sec-fetch-site": "cross-site"
+  }
+}
+
+function platformReferer(platform) {
+  if (platform === "tiktok") return "https://www.tiktok.com/"
+  if (platform === "instagram") return "https://www.instagram.com/"
+  if (platform === "pinterest") return "https://www.pinterest.com/"
+  return "https://www.google.com/"
+}
+
+function extFromContentType(contentType) {
+  const type = String(contentType || "").toLowerCase()
+  if (type.includes("jpeg") || type.includes("jpg")) return "jpg"
+  if (type.includes("png")) return "png"
+  if (type.includes("webp")) return "webp"
+  if (type.includes("avif")) return "avif"
+  if (type.includes("gif")) return "gif"
+  return ""
+}
+
+function sanitizeFilePart(value) {
+  return String(value || "image").replace(/[^a-z0-9_-]+/gi, "-").slice(0, 50)
+}
+
+function cleanupOldMedia(maxAgeMs = 60 * 60 * 1000) {
+  try {
+    const now = Date.now()
+    for (const file of readdirSync(MEDIA_DIR)) {
+      const filepath = join(MEDIA_DIR, file)
+      const stat = statSync(filepath)
+      if (now - stat.mtimeMs > maxAgeMs) {
+        rmSync(filepath, { force: true })
+      }
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
 
 function proxifySlides(slides, baseUrl) {
   return slides.map((slide, index) => ({
