@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "7.0.2-provider-media-filter",
+  "version": "7.0.4-ig-carousel-regex-hotfix",
   "type": "module",
   "private": true,
   "scripts": {

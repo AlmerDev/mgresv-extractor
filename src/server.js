@@ -11,7 +11,7 @@ const PROVIDER_MODE = String(process.env.PROVIDER_MODE || "auto").toLowerCase()
 
 const APIFY_TOKEN = process.env.APIFY_TOKEN || ""
 const APIFY_TIKTOK_ACTOR = process.env.APIFY_TIKTOK_ACTOR || "clockworks/tiktok-scraper"
-const APIFY_INSTAGRAM_ACTOR = process.env.APIFY_INSTAGRAM_ACTOR || "apify/instagram-post-scraper"
+const APIFY_INSTAGRAM_ACTOR = process.env.APIFY_INSTAGRAM_ACTOR || "apify/instagram-api-scraper"
 const APIFY_TIMEOUT_SECS = Number(process.env.APIFY_TIMEOUT_SECS || 45)
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || ""
@@ -208,11 +208,17 @@ function buildApifyInputCandidates(url, platform) {
   }
 
   if (platform === "instagram") {
+    const shortcode = extractInstagramShortcode(url)
+
     return [
-      { directUrls: [url], resultsType: "posts", resultsLimit: 1 },
-      { startUrls: [{ url }], resultsType: "posts", resultsLimit: 1 },
-      { urls: [url], resultsLimit: 1 }
-    ]
+      { directUrls: [url], resultsType: "posts", resultsLimit: 1, addParentData: false },
+      { directUrls: [url], resultsLimit: 1 },
+      { startUrls: [{ url }], resultsType: "posts", resultsLimit: 1, addParentData: false },
+      { startUrls: [{ url }], resultsLimit: 1 },
+      { urls: [url], resultsLimit: 1 },
+      { url, resultsLimit: 1 },
+      shortcode ? { shortcodes: [shortcode], resultsType: "posts", resultsLimit: 1 } : null
+    ].filter(Boolean)
   }
 
   return [
@@ -243,6 +249,7 @@ async function extractLite(url, platform, kind) {
 
 function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) {
   const raw = providerPayload?.data ?? providerPayload ?? {}
+  const instagramExplicitImages = platform === "instagram" ? extractInstagramCarouselImages(raw) : []
   const title = pickTitle(raw) || defaultTitle(platform, knownKind)
   const allUrls = []
   const imageUrls = []
@@ -259,6 +266,10 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     if (isLikelyVideoUrl(clean)) videoUrls.push(clean)
     if (isLikelyAudioUrl(clean)) audioUrls.push(clean)
   })
+
+  for (const image of instagramExplicitImages) {
+    imageUrls.push(image)
+  }
 
   // Also support common explicit array fields.
   for (const item of flattenItems(raw)) {
@@ -324,6 +335,8 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
       imageCount: uniqueImages.length,
       rejectedImageCount: rejectedImages.length,
       rejectedImageSamples: rejectedImages.slice(0, 3),
+      instagramExplicitCount: typeof instagramExplicitImages !== "undefined" ? instagramExplicitImages.length : 0,
+      firstItemKeys: firstItemKeys(raw),
       videoCount: unique(videoUrls).length,
       audioCount: unique(audioUrls).length
     },
@@ -334,6 +347,106 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     }
   }
 }
+
+function extractInstagramCarouselImages(raw) {
+  const items = flattenItems(raw)
+  const output = []
+
+  function push(value) {
+    const clean = cleanMediaUrl(value)
+    if (clean && isValidImageForPlatform(clean, "instagram")) output.push(clean)
+  }
+
+  function scanNode(node, depth = 0) {
+    if (!node || depth > 10) return
+
+    if (typeof node === "string") {
+      push(node)
+      return
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) scanNode(item, depth + 1)
+      return
+    }
+
+    if (typeof node === "object") {
+      push(node.displayUrl)
+      push(node.display_url)
+      push(node.thumbnailUrl)
+      push(node.thumbnail_url)
+      push(node.imageUrl)
+      push(node.image_url)
+      push(node.url)
+      push(node.src)
+
+      if (Array.isArray(node.images)) scanNode(node.images, depth + 1)
+      if (Array.isArray(node.photos)) scanNode(node.photos, depth + 1)
+      if (Array.isArray(node.media)) scanNode(node.media, depth + 1)
+      if (Array.isArray(node.childPosts)) scanNode(node.childPosts, depth + 1)
+      if (Array.isArray(node.child_posts)) scanNode(node.child_posts, depth + 1)
+      if (Array.isArray(node.children)) scanNode(node.children, depth + 1)
+      if (Array.isArray(node.sidecarChildren)) scanNode(node.sidecarChildren, depth + 1)
+      if (Array.isArray(node.sidecar_children)) scanNode(node.sidecar_children, depth + 1)
+      if (Array.isArray(node.carouselMedia)) scanNode(node.carouselMedia, depth + 1)
+      if (Array.isArray(node.carousel_media)) scanNode(node.carousel_media, depth + 1)
+
+      const edges = node.edge_sidecar_to_children?.edges ||
+        node.edgeSidecarToChildren?.edges ||
+        node.carousel_media_edges
+
+      if (Array.isArray(edges)) {
+        for (const edge of edges) {
+          scanNode(edge?.node || edge, depth + 1)
+        }
+      }
+
+      const candidates = node.image_versions2?.candidates || node.imageVersions2?.candidates
+      if (Array.isArray(candidates)) {
+        for (const candidate of candidates) {
+          push(candidate.url)
+        }
+      }
+
+      const resources = node.displayResources || node.display_resources
+      if (Array.isArray(resources)) {
+        for (const resource of resources) {
+          push(resource.src || resource.url)
+        }
+      }
+
+      for (const [key, value] of Object.entries(node)) {
+        if (/avatar|profile|owner|user|comment|like|share|icon|logo|emoji/i.test(key)) continue
+        if (/image|photo|display|thumbnail|carousel|sidecar|children|media|url/i.test(key)) {
+          scanNode(value, depth + 1)
+        }
+      }
+    }
+  }
+
+  for (const item of items) {
+    scanNode(item)
+  }
+
+  return unique(output).slice(0, 20)
+}
+
+function firstItemKeys(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return []
+  return Object.keys(first).slice(0, 50)
+}
+
+function extractInstagramShortcode(value) {
+  try {
+    const parsed = new URL(value)
+    const match = parsed.pathname.match(/\/(?:p|reel|reels)\/([^/?#]+)/i)
+    return match?.[1] || ""
+  } catch {
+    return ""
+  }
+}
+
 
 function flattenItems(raw) {
   if (Array.isArray(raw)) return raw
