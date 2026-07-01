@@ -13,6 +13,12 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN || ""
 const APIFY_TIKTOK_ACTOR = process.env.APIFY_TIKTOK_ACTOR || "clockworks/tiktok-scraper"
 const APIFY_INSTAGRAM_ACTOR = process.env.APIFY_INSTAGRAM_ACTOR || "apify/instagram-api-scraper"
 const APIFY_FACEBOOK_ACTOR = process.env.APIFY_FACEBOOK_ACTOR || ""
+const APIFY_X_ACTOR = process.env.APIFY_X_ACTOR || "apidojo/tweet-scraper"
+const APIFY_THREADS_ACTOR = process.env.APIFY_THREADS_ACTOR || "automation-lab/threads-scraper"
+const APIFY_PINTEREST_ACTOR = process.env.APIFY_PINTEREST_ACTOR || "danielmilevski9/pinterest-crawler"
+const APIFY_REDDIT_ACTOR = process.env.APIFY_REDDIT_ACTOR || "trudax/reddit-scraper"
+const APIFY_VIMEO_ACTOR = process.env.APIFY_VIMEO_ACTOR || ""
+const APIFY_SOUNDCLOUD_ACTOR = process.env.APIFY_SOUNDCLOUD_ACTOR || ""
 const APIFY_TIMEOUT_SECS = Number(process.env.APIFY_TIMEOUT_SECS || 45)
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || ""
@@ -40,7 +46,13 @@ app.get("/health", (req, res) => {
       rapidapiEnabled: Boolean(RAPIDAPI_KEY),
       tiktokRapidHost: Boolean(RAPIDAPI_TIKTOK_HOST),
       instagramRapidHost: Boolean(RAPIDAPI_INSTAGRAM_HOST),
-      facebookActorEnabled: Boolean(APIFY_FACEBOOK_ACTOR)
+      facebookActorEnabled: Boolean(APIFY_FACEBOOK_ACTOR),
+      xActorEnabled: Boolean(APIFY_X_ACTOR),
+      threadsActorEnabled: Boolean(APIFY_THREADS_ACTOR),
+      pinterestActorEnabled: Boolean(APIFY_PINTEREST_ACTOR),
+      redditActorEnabled: Boolean(APIFY_REDDIT_ACTOR),
+      vimeoActorEnabled: Boolean(APIFY_VIMEO_ACTOR),
+      soundcloudActorEnabled: Boolean(APIFY_SOUNDCLOUD_ACTOR)
     },
     supports: [
       "TikTok photo/video/provider extraction",
@@ -167,6 +179,12 @@ async function extractViaApify(url, platform, kind) {
   if (platform === "tiktok") actor = APIFY_TIKTOK_ACTOR
   if (platform === "instagram") actor = APIFY_INSTAGRAM_ACTOR
   if (platform === "facebook") actor = APIFY_FACEBOOK_ACTOR
+  if (platform === "x") actor = APIFY_X_ACTOR
+  if (platform === "threads") actor = APIFY_THREADS_ACTOR
+  if (platform === "pinterest") actor = APIFY_PINTEREST_ACTOR
+  if (platform === "reddit") actor = APIFY_REDDIT_ACTOR
+  if (platform === "vimeo") actor = APIFY_VIMEO_ACTOR
+  if (platform === "soundcloud") actor = APIFY_SOUNDCLOUD_ACTOR
 
   if (!actor) return null
 
@@ -224,6 +242,39 @@ function buildApifyInputCandidates(url, platform) {
     ].filter(Boolean)
   }
 
+
+  if (platform === "x") {
+    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
+    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
+    return /(pbs\.twimg|twimg|x\.com|twitter\.com)/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
+      /image|photo|picture|media/.test(value)
+  }
+
+  if (platform === "threads") {
+    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
+    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
+    return /(cdninstagram|fbcdn|scontent|threads)/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
+      /image|photo|picture|media/.test(value)
+  }
+
+  if (platform === "pinterest") {
+    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
+    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
+    return /(pinimg|pinterest|pin\.it)/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
+      /image|photo|picture|media/.test(value)
+  }
+
+  if (platform === "reddit") {
+    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
+    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
+    return /(i\.redd\.it|preview\.redd\.it|redditmedia|redd\.it|imgur)/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
+      /image|photo|picture|media/.test(value)
+  }
+
   if (platform === "facebook") {
     return [
       { startUrls: [{ url }], resultsLimit: 1 },
@@ -264,13 +315,14 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
   const raw = providerPayload?.data ?? providerPayload ?? {}
   const instagramExplicitImages = platform === "instagram" ? extractInstagramCarouselImages(raw) : []
   const facebookExplicitImages = platform === "facebook" ? extractFacebookPostImages(raw) : []
+  const socialExplicitImages = ["x", "threads", "pinterest", "reddit"].includes(platform) ? extractGenericPostImages(raw, platform) : []
   const title = pickTitle(raw) || defaultTitle(platform, knownKind)
   const allUrls = []
   const imageUrls = []
   const videoUrls = []
   const audioUrls = []
 
-  if (platform !== "instagram" && platform !== "facebook") walkAny(raw, (value, key) => {
+  if (!["instagram", "facebook", "x", "threads", "pinterest", "reddit"].includes(platform)) walkAny(raw, (value, key) => {
     const clean = cleanMediaUrl(value)
     if (!clean) return
 
@@ -289,8 +341,12 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     imageUrls.push(image)
   }
 
+  for (const image of socialExplicitImages) {
+    imageUrls.push(image)
+  }
+
   // Also support common explicit array fields.
-  if (platform !== "instagram" && platform !== "facebook") for (const item of flattenItems(raw)) {
+  if (!["instagram", "facebook", "x", "threads", "pinterest", "reddit"].includes(platform)) for (const item of flattenItems(raw)) {
     for (const field of [
       "images", "imageUrls", "image_urls", "photos", "slides", "carouselMedia",
       "carousel_media", "carousel_media_edges", "edge_sidecar_to_children",
@@ -357,6 +413,7 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
       instagramSlideSource: instagramSlideSource(raw),
       facebookExplicitCount: typeof facebookExplicitImages !== "undefined" ? facebookExplicitImages.length : 0,
       facebookSlideSource: facebookSlideSource(raw),
+      socialExplicitCount: typeof socialExplicitImages !== "undefined" ? socialExplicitImages.length : 0,
       firstItemKeys: firstItemKeys(raw),
       firstItemMediaSummary: firstItemMediaSummary(raw),
       videoCount: unique(videoUrls).length,
@@ -555,6 +612,97 @@ function facebookSlideSource(raw) {
   if (first.picture) return "picture"
   if (first.thumbnail || first.thumbnailUrl || first.thumbnail_url) return "thumbnail"
   return "none"
+}
+
+
+function extractGenericPostImages(raw, platform) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object") return []
+
+  const sources = [
+    first.media,
+    first.medias,
+    first.images,
+    first.image,
+    first.photos,
+    first.photo,
+    first.pictures,
+    first.picture,
+    first.attachments,
+    first.gallery,
+    first.galleryData,
+    first.gallery_data,
+    first.preview,
+    first.thumbnail,
+    first.thumbnailUrl,
+    first.thumbnail_url,
+    first.displayUrl,
+    first.display_url,
+    first.url
+  ]
+
+  for (const source of sources) {
+    const collected = collectGenericImages(source, platform)
+    if (collected.length) return unique(collected).slice(0, 12)
+  }
+
+  return []
+}
+
+function collectGenericImages(node, platform, depth = 0) {
+  const output = []
+  if (!node || depth > 8) return output
+
+  function push(value) {
+    const clean = cleanMediaUrl(value)
+    if (clean && isValidImageForPlatform(clean, platform)) output.push(clean)
+  }
+
+  if (typeof node === "string") {
+    push(node)
+    return output
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) output.push(...collectGenericImages(item, platform, depth + 1))
+    return output
+  }
+
+  if (typeof node !== "object") return output
+
+  push(node.url)
+  push(node.src)
+  push(node.image)
+  push(node.imageUrl)
+  push(node.image_url)
+  push(node.mediaUrl)
+  push(node.media_url)
+  push(node.displayUrl)
+  push(node.display_url)
+  push(node.thumbnail)
+  push(node.thumbnailUrl)
+  push(node.thumbnail_url)
+  push(node.previewUrl)
+  push(node.preview_url)
+
+  for (const [key, value] of Object.entries(node)) {
+    if (/avatar|profile|author|owner|user|comment|reply|reaction|like|icon|logo|emoji/i.test(key)) continue
+    if (/media|image|photo|picture|thumbnail|preview|gallery|attachment|url|src/i.test(key)) {
+      output.push(...collectGenericImages(value, platform, depth + 1))
+    }
+  }
+
+  return output
+}
+
+function extractTweetId(value) {
+  try {
+    const parsed = new URL(value)
+    const match = parsed.pathname.match(/\/status(?:es)?\/(\d+)/i)
+    return match?.[1] || ""
+  } catch {
+    return ""
+  }
 }
 
 
@@ -859,7 +1007,14 @@ function detectKindFromUrl(value, platform) {
       if (path.includes("/share/p/") || path.includes("/photo") || path.includes("/posts/") || path.includes("/permalink/") || path.includes("/story.php")) return "photo"
     }
 
+    if (platform === "x") return "video"
+    if (platform === "threads") return "photo"
     if (platform === "pinterest") return "photo"
+    if (platform === "reddit") {
+      if (path.includes("/gallery/") || path.includes("/r/")) return "photo"
+    }
+    if (platform === "soundcloud") return "audio"
+    if (platform === "vimeo") return "video"
 
     if (/\.(jpg|jpeg|png|webp|avif)$/.test(path)) return "photo"
     if (/\.(mp4|webm|mov|mkv)$/.test(path)) return "video"
@@ -950,7 +1105,7 @@ function isLikelyVideoUrl(url) {
 
 function isLikelyAudioUrl(url) {
   const value = String(url || "").toLowerCase()
-  return /mime_type=audio|audio_mpeg|audio_mp4|\.(mp3|m4a|wav|ogg|opus)(\?|$)/.test(value)
+  return /mime_type=audio|audio_mpeg|audio_mp4|soundcloud|\.(mp3|m4a|wav|ogg|opus)(\?|$)/.test(value)
 }
 
 function firstClean(values) {

@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "7.0.8-facebook-post-photo-fix",
+  "version": "7.1.0-more-platforms-apify",
   "type": "module",
   "private": true,
   "scripts": {
