@@ -12,6 +12,7 @@ const PROVIDER_MODE = String(process.env.PROVIDER_MODE || "auto").toLowerCase()
 const APIFY_TOKEN = process.env.APIFY_TOKEN || ""
 const APIFY_TIKTOK_ACTOR = process.env.APIFY_TIKTOK_ACTOR || "clockworks/tiktok-scraper"
 const APIFY_INSTAGRAM_ACTOR = process.env.APIFY_INSTAGRAM_ACTOR || "apify/instagram-api-scraper"
+const APIFY_FACEBOOK_ACTOR = process.env.APIFY_FACEBOOK_ACTOR || ""
 const APIFY_TIMEOUT_SECS = Number(process.env.APIFY_TIMEOUT_SECS || 45)
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || ""
@@ -38,7 +39,8 @@ app.get("/health", (req, res) => {
       apifyEnabled: Boolean(APIFY_TOKEN),
       rapidapiEnabled: Boolean(RAPIDAPI_KEY),
       tiktokRapidHost: Boolean(RAPIDAPI_TIKTOK_HOST),
-      instagramRapidHost: Boolean(RAPIDAPI_INSTAGRAM_HOST)
+      instagramRapidHost: Boolean(RAPIDAPI_INSTAGRAM_HOST),
+      facebookActorEnabled: Boolean(APIFY_FACEBOOK_ACTOR)
     },
     supports: [
       "TikTok photo/video/provider extraction",
@@ -164,6 +166,7 @@ async function extractViaApify(url, platform, kind) {
 
   if (platform === "tiktok") actor = APIFY_TIKTOK_ACTOR
   if (platform === "instagram") actor = APIFY_INSTAGRAM_ACTOR
+  if (platform === "facebook") actor = APIFY_FACEBOOK_ACTOR
 
   if (!actor) return null
 
@@ -221,6 +224,16 @@ function buildApifyInputCandidates(url, platform) {
     ].filter(Boolean)
   }
 
+  if (platform === "facebook") {
+    return [
+      { startUrls: [{ url }], resultsLimit: 1 },
+      { startUrls: [url], resultsLimit: 1 },
+      { urls: [url], resultsLimit: 1 },
+      { url, resultsLimit: 1 },
+      { directUrls: [url], resultsLimit: 1 }
+    ]
+  }
+
   return [
     { startUrls: [{ url }], resultsLimit: 1 },
     { urls: [url], resultsLimit: 1 }
@@ -250,13 +263,14 @@ async function extractLite(url, platform, kind) {
 function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) {
   const raw = providerPayload?.data ?? providerPayload ?? {}
   const instagramExplicitImages = platform === "instagram" ? extractInstagramCarouselImages(raw) : []
+  const facebookExplicitImages = platform === "facebook" ? extractFacebookPostImages(raw) : []
   const title = pickTitle(raw) || defaultTitle(platform, knownKind)
   const allUrls = []
   const imageUrls = []
   const videoUrls = []
   const audioUrls = []
 
-  if (platform !== "instagram") walkAny(raw, (value, key) => {
+  if (platform !== "instagram" && platform !== "facebook") walkAny(raw, (value, key) => {
     const clean = cleanMediaUrl(value)
     if (!clean) return
 
@@ -271,8 +285,12 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     imageUrls.push(image)
   }
 
+  for (const image of facebookExplicitImages) {
+    imageUrls.push(image)
+  }
+
   // Also support common explicit array fields.
-  if (platform !== "instagram") for (const item of flattenItems(raw)) {
+  if (platform !== "instagram" && platform !== "facebook") for (const item of flattenItems(raw)) {
     for (const field of [
       "images", "imageUrls", "image_urls", "photos", "slides", "carouselMedia",
       "carousel_media", "carousel_media_edges", "edge_sidecar_to_children",
@@ -337,6 +355,8 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
       rejectedImageSamples: rejectedImages.slice(0, 3),
       instagramExplicitCount: typeof instagramExplicitImages !== "undefined" ? instagramExplicitImages.length : 0,
       instagramSlideSource: instagramSlideSource(raw),
+      facebookExplicitCount: typeof facebookExplicitImages !== "undefined" ? facebookExplicitImages.length : 0,
+      facebookSlideSource: facebookSlideSource(raw),
       firstItemKeys: firstItemKeys(raw),
       firstItemMediaSummary: firstItemMediaSummary(raw),
       videoCount: unique(videoUrls).length,
@@ -442,6 +462,99 @@ function pickOneInstagramImage(node) {
   }
 
   return ""
+}
+
+
+function extractFacebookPostImages(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object") return []
+
+  const orderedSources = [
+    first.attachments,
+    first.media,
+    first.medias,
+    first.photos,
+    first.images,
+    first.postImages,
+    first.post_images,
+    first.image,
+    first.fullPicture,
+    first.full_picture,
+    first.picture,
+    first.thumbnail,
+    first.thumbnailUrl,
+    first.thumbnail_url
+  ]
+
+  for (const source of orderedSources) {
+    const collected = collectFacebookImages(source)
+    if (collected.length) return unique(collected).slice(0, 12)
+  }
+
+  return []
+}
+
+function collectFacebookImages(node, depth = 0) {
+  const output = []
+  if (!node || depth > 8) return output
+
+  function push(value) {
+    const clean = cleanMediaUrl(value)
+    if (clean && isValidImageForPlatform(clean, "facebook")) output.push(clean)
+  }
+
+  if (typeof node === "string") {
+    push(node)
+    return output
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) output.push(...collectFacebookImages(item, depth + 1))
+    return output
+  }
+
+  if (typeof node !== "object") return output
+
+  push(node.url)
+  push(node.src)
+  push(node.image)
+  push(node.picture)
+  push(node.fullPicture)
+  push(node.full_picture)
+  push(node.thumbnail)
+  push(node.thumbnailUrl)
+  push(node.thumbnail_url)
+
+  if (node.media) output.push(...collectFacebookImages(node.media, depth + 1))
+  if (node.image) output.push(...collectFacebookImages(node.image, depth + 1))
+  if (node.photo_image) output.push(...collectFacebookImages(node.photo_image, depth + 1))
+  if (node.cover_photo) output.push(...collectFacebookImages(node.cover_photo, depth + 1))
+  if (node.subattachments) output.push(...collectFacebookImages(node.subattachments, depth + 1))
+  if (node.child_attachments) output.push(...collectFacebookImages(node.child_attachments, depth + 1))
+  if (node.data) output.push(...collectFacebookImages(node.data, depth + 1))
+
+  for (const [key, value] of Object.entries(node)) {
+    if (/avatar|profile|author|owner|user|comment|reaction|like|icon|logo|emoji/i.test(key)) continue
+    if (/attachment|media|image|photo|picture|thumbnail|url|src/i.test(key)) {
+      output.push(...collectFacebookImages(value, depth + 1))
+    }
+  }
+
+  return output
+}
+
+function facebookSlideSource(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return "none"
+  if (first.attachments) return "attachments"
+  if (first.media || first.medias) return "media"
+  if (first.photos) return "photos"
+  if (first.images) return "images"
+  if (first.postImages || first.post_images) return "postImages"
+  if (first.fullPicture || first.full_picture) return "fullPicture"
+  if (first.picture) return "picture"
+  if (first.thumbnail || first.thumbnailUrl || first.thumbnail_url) return "thumbnail"
+  return "none"
 }
 
 
@@ -728,6 +841,7 @@ function detectKindFromUrl(value, platform) {
   try {
     const parsed = new URL(value)
     const path = parsed.pathname.toLowerCase()
+    const host = parsed.hostname.toLowerCase()
 
     if (platform === "tiktok") {
       if (path.includes("/photo/")) return "photo"
@@ -738,6 +852,11 @@ function detectKindFromUrl(value, platform) {
     if (platform === "instagram") {
       if (path.includes("/reel/") || path.includes("/reels/")) return "video"
       if (path.includes("/p/")) return "photo"
+    }
+
+    if (platform === "facebook") {
+      if (host.includes("fb.watch") || path.includes("/watch") || path.includes("/videos/") || path.includes("/share/v/")) return "video"
+      if (path.includes("/share/p/") || path.includes("/photo") || path.includes("/posts/") || path.includes("/permalink/") || path.includes("/story.php")) return "photo"
     }
 
     if (platform === "pinterest") return "photo"
@@ -780,7 +899,7 @@ function isSafeProviderImageUrl(url) {
   if (/mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.webm(\?|$)|\.mov(\?|$)/.test(value)) return false
   if (/avatar|profile|emoji|icon|logo|sprite|glyph|favicon|rsrc\.php/.test(value)) return false
 
-  return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) ||
+  return /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
     /scontent|cdninstagram|fbcdn|instagram|display|image|photo|media/.test(value)
 }
 
@@ -807,11 +926,20 @@ function isValidImageForPlatform(url, platform) {
     if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
 
     return /(scontent|cdninstagram|fbcdn|instagram)/.test(value) ||
-      /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
       /image|photo|display|media/.test(value)
   }
 
-  return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) || /image|photo/.test(value)
+  if (platform === "facebook") {
+    if (/profile|avatar|emoji|icon|logo|sprite|rsrc\.php|static/.test(value)) return false
+    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
+
+    return /(fbcdn|scontent|facebook|fbsbx)/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
+      /image|photo|picture|media/.test(value)
+  }
+
+  return /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) || /image|photo/.test(value)
 }
 
 function isLikelyVideoUrl(url) {
@@ -880,7 +1008,7 @@ function fallbackThumbnail(platform, kind) {
 }
 
 function guessImageExt(url) {
-  const match = String(url || "").toLowerCase().match(/\.(jpg|jpeg|png|webp|avif)(\?|$)/)
+  const match = String(url || "").toLowerCase().match(/\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/)
   return match?.[1] || "jpg"
 }
 
