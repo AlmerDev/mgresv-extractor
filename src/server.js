@@ -256,7 +256,7 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
   const videoUrls = []
   const audioUrls = []
 
-  walkAny(raw, (value, key) => {
+  if (platform !== "instagram") walkAny(raw, (value, key) => {
     const clean = cleanMediaUrl(value)
     if (!clean) return
 
@@ -272,7 +272,7 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
   }
 
   // Also support common explicit array fields.
-  for (const item of flattenItems(raw)) {
+  if (platform !== "instagram") for (const item of flattenItems(raw)) {
     for (const field of [
       "images", "imageUrls", "image_urls", "photos", "slides", "carouselMedia",
       "carousel_media", "carousel_media_edges", "edge_sidecar_to_children",
@@ -336,6 +336,7 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
       rejectedImageCount: rejectedImages.length,
       rejectedImageSamples: rejectedImages.slice(0, 3),
       instagramExplicitCount: typeof instagramExplicitImages !== "undefined" ? instagramExplicitImages.length : 0,
+      instagramSlideSource: instagramSlideSource(raw),
       firstItemKeys: firstItemKeys(raw),
       firstItemMediaSummary: firstItemMediaSummary(raw),
       videoCount: unique(videoUrls).length,
@@ -350,91 +351,97 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
 }
 
 function extractInstagramCarouselImages(raw) {
-  const items = flattenItems(raw)
-  const output = []
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object") return []
 
-  function push(value) {
-    const clean = cleanMediaUrl(value)
-    if (clean && isSafeProviderImageUrl(clean)) output.push(clean)
+  // Apify Instagram often returns the same post media in multiple fields.
+  // For carousel, childPosts is the real post slide list. Do not merge it with
+  // displayUrl/images, because that creates 1 + 5 + 5 = 11 duplicated items.
+  const childPosts = Array.isArray(first.childPosts) ? first.childPosts :
+    Array.isArray(first.child_posts) ? first.child_posts :
+      Array.isArray(first.children) ? first.children :
+        Array.isArray(first.sidecarChildren) ? first.sidecarChildren :
+          Array.isArray(first.sidecar_children) ? first.sidecar_children :
+            Array.isArray(first.carouselMedia) ? first.carouselMedia :
+              Array.isArray(first.carousel_media) ? first.carousel_media : []
+
+  if (childPosts.length > 0) {
+    return unique(childPosts.map((child) => pickOneInstagramImage(child)).filter(Boolean)).slice(0, 20)
   }
 
-  function pushBestFromArray(arr) {
-    if (!Array.isArray(arr)) return
-    // Prefer highest-looking candidate later in array, but still include all valid to preserve carousel.
-    for (const item of arr) {
-      scanNode(item, 1)
+  const images = Array.isArray(first.images) ? first.images :
+    Array.isArray(first.imageUrls) ? first.imageUrls :
+      Array.isArray(first.image_urls) ? first.image_urls :
+        Array.isArray(first.photos) ? first.photos : []
+
+  if (images.length > 0) {
+    return unique(images.map((image) => pickOneInstagramImage(image)).filter(Boolean)).slice(0, 20)
+  }
+
+  const edges = first.edge_sidecar_to_children?.edges ||
+    first.edgeSidecarToChildren?.edges ||
+    first.carousel_media_edges
+
+  if (Array.isArray(edges) && edges.length > 0) {
+    return unique(edges.map((edge) => pickOneInstagramImage(edge?.node || edge)).filter(Boolean)).slice(0, 20)
+  }
+
+  const single = pickOneInstagramImage(first)
+  return single ? [single] : []
+}
+
+function pickOneInstagramImage(node) {
+  if (!node) return ""
+
+  if (typeof node === "string") {
+    const clean = cleanMediaUrl(node)
+    return clean && isSafeProviderImageUrl(clean) ? clean : ""
+  }
+
+  if (Array.isArray(node)) {
+    // images/displayResources are usually size variants; pick only one best candidate.
+    for (let index = node.length - 1; index >= 0; index -= 1) {
+      const candidate = pickOneInstagramImage(node[index])
+      if (candidate) return candidate
+    }
+    return ""
+  }
+
+  if (typeof node !== "object") return ""
+
+  const directCandidates = [
+    node.displayUrl,
+    node.display_url,
+    node.imageUrl,
+    node.image_url,
+    node.thumbnailUrl,
+    node.thumbnail_url,
+    node.url,
+    node.src
+  ]
+
+  for (const candidate of directCandidates) {
+    const clean = cleanMediaUrl(candidate)
+    if (clean && isSafeProviderImageUrl(clean)) return clean
+  }
+
+  const resourceArrays = [
+    node.images,
+    node.displayResources,
+    node.display_resources,
+    node.image_versions2?.candidates,
+    node.imageVersions2?.candidates
+  ]
+
+  for (const arr of resourceArrays) {
+    if (!Array.isArray(arr)) continue
+    for (let index = arr.length - 1; index >= 0; index -= 1) {
+      const candidate = pickOneInstagramImage(arr[index])
+      if (candidate) return candidate
     }
   }
 
-  function scanNode(node, depth = 0) {
-    if (!node || depth > 12) return
-
-    if (typeof node === "string") {
-      push(node)
-      return
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) scanNode(item, depth + 1)
-      return
-    }
-
-    if (typeof node === "object") {
-      // Direct fields from Apify Instagram output.
-      push(node.displayUrl)
-      push(node.display_url)
-      push(node.thumbnailUrl)
-      push(node.thumbnail_url)
-      push(node.imageUrl)
-      push(node.image_url)
-      push(node.url)
-      push(node.src)
-
-      // Apify sometimes uses images: [{ url, width, height }, ...] or images: ["..."].
-      pushBestFromArray(node.images)
-      pushBestFromArray(node.photos)
-      pushBestFromArray(node.media)
-
-      // Carousel / sidecar children.
-      pushBestFromArray(node.childPosts)
-      pushBestFromArray(node.child_posts)
-      pushBestFromArray(node.children)
-      pushBestFromArray(node.sidecarChildren)
-      pushBestFromArray(node.sidecar_children)
-      pushBestFromArray(node.carouselMedia)
-      pushBestFromArray(node.carousel_media)
-
-      const edges = node.edge_sidecar_to_children?.edges ||
-        node.edgeSidecarToChildren?.edges ||
-        node.carousel_media_edges
-
-      if (Array.isArray(edges)) {
-        for (const edge of edges) {
-          scanNode(edge?.node || edge, depth + 1)
-        }
-      }
-
-      const candidates = node.image_versions2?.candidates || node.imageVersions2?.candidates
-      pushBestFromArray(candidates)
-
-      const resources = node.displayResources || node.display_resources
-      pushBestFromArray(resources)
-
-      // Generic fallback: only scan keys that look like media fields.
-      for (const [key, value] of Object.entries(node)) {
-        if (/avatar|profile|owner|user|comment|like|share|icon|logo|emoji/i.test(key)) continue
-        if (/image|photo|display|thumbnail|carousel|sidecar|children|media|url|src/i.test(key)) {
-          scanNode(value, depth + 1)
-        }
-      }
-    }
-  }
-
-  for (const item of items) {
-    scanNode(item)
-  }
-
-  return unique(output).slice(0, 30)
+  return ""
 }
 
 
@@ -457,6 +464,21 @@ function firstItemMediaSummary(raw) {
     childPostsLength: Array.isArray(first.childPosts) ? first.childPosts.length : 0
   }
 }
+
+function instagramSlideSource(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return "none"
+
+  if (Array.isArray(first.childPosts) && first.childPosts.length) return "childPosts"
+  if (Array.isArray(first.child_posts) && first.child_posts.length) return "child_posts"
+  if (Array.isArray(first.children) && first.children.length) return "children"
+  if (Array.isArray(first.sidecarChildren) && first.sidecarChildren.length) return "sidecarChildren"
+  if (Array.isArray(first.carouselMedia) && first.carouselMedia.length) return "carouselMedia"
+  if (Array.isArray(first.images) && first.images.length) return "images"
+  if (first.displayUrl || first.display_url) return "displayUrl"
+  return "none"
+}
+
 
 function extractInstagramShortcode(value) {
   try {

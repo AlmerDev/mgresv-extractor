@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "7.0.6-full-ig-web-dedupe-merged",
+  "version": "7.0.7-ig-post-slides-only-final",
   "type": "module",
   "private": true,
   "scripts": {
