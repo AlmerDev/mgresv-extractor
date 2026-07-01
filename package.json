@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "7.0.4-ig-carousel-regex-hotfix",
+  "version": "7.0.5-ig-displayurl-childposts-fix",
   "type": "module",
   "private": true,
   "scripts": {

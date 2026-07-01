@@ -337,6 +337,7 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
       rejectedImageSamples: rejectedImages.slice(0, 3),
       instagramExplicitCount: typeof instagramExplicitImages !== "undefined" ? instagramExplicitImages.length : 0,
       firstItemKeys: firstItemKeys(raw),
+      firstItemMediaSummary: firstItemMediaSummary(raw),
       videoCount: unique(videoUrls).length,
       audioCount: unique(audioUrls).length
     },
@@ -354,11 +355,19 @@ function extractInstagramCarouselImages(raw) {
 
   function push(value) {
     const clean = cleanMediaUrl(value)
-    if (clean && isValidImageForPlatform(clean, "instagram")) output.push(clean)
+    if (clean && isSafeProviderImageUrl(clean)) output.push(clean)
+  }
+
+  function pushBestFromArray(arr) {
+    if (!Array.isArray(arr)) return
+    // Prefer highest-looking candidate later in array, but still include all valid to preserve carousel.
+    for (const item of arr) {
+      scanNode(item, 1)
+    }
   }
 
   function scanNode(node, depth = 0) {
-    if (!node || depth > 10) return
+    if (!node || depth > 12) return
 
     if (typeof node === "string") {
       push(node)
@@ -371,6 +380,7 @@ function extractInstagramCarouselImages(raw) {
     }
 
     if (typeof node === "object") {
+      // Direct fields from Apify Instagram output.
       push(node.displayUrl)
       push(node.display_url)
       push(node.thumbnailUrl)
@@ -380,16 +390,19 @@ function extractInstagramCarouselImages(raw) {
       push(node.url)
       push(node.src)
 
-      if (Array.isArray(node.images)) scanNode(node.images, depth + 1)
-      if (Array.isArray(node.photos)) scanNode(node.photos, depth + 1)
-      if (Array.isArray(node.media)) scanNode(node.media, depth + 1)
-      if (Array.isArray(node.childPosts)) scanNode(node.childPosts, depth + 1)
-      if (Array.isArray(node.child_posts)) scanNode(node.child_posts, depth + 1)
-      if (Array.isArray(node.children)) scanNode(node.children, depth + 1)
-      if (Array.isArray(node.sidecarChildren)) scanNode(node.sidecarChildren, depth + 1)
-      if (Array.isArray(node.sidecar_children)) scanNode(node.sidecar_children, depth + 1)
-      if (Array.isArray(node.carouselMedia)) scanNode(node.carouselMedia, depth + 1)
-      if (Array.isArray(node.carousel_media)) scanNode(node.carousel_media, depth + 1)
+      // Apify sometimes uses images: [{ url, width, height }, ...] or images: ["..."].
+      pushBestFromArray(node.images)
+      pushBestFromArray(node.photos)
+      pushBestFromArray(node.media)
+
+      // Carousel / sidecar children.
+      pushBestFromArray(node.childPosts)
+      pushBestFromArray(node.child_posts)
+      pushBestFromArray(node.children)
+      pushBestFromArray(node.sidecarChildren)
+      pushBestFromArray(node.sidecar_children)
+      pushBestFromArray(node.carouselMedia)
+      pushBestFromArray(node.carousel_media)
 
       const edges = node.edge_sidecar_to_children?.edges ||
         node.edgeSidecarToChildren?.edges ||
@@ -402,22 +415,15 @@ function extractInstagramCarouselImages(raw) {
       }
 
       const candidates = node.image_versions2?.candidates || node.imageVersions2?.candidates
-      if (Array.isArray(candidates)) {
-        for (const candidate of candidates) {
-          push(candidate.url)
-        }
-      }
+      pushBestFromArray(candidates)
 
       const resources = node.displayResources || node.display_resources
-      if (Array.isArray(resources)) {
-        for (const resource of resources) {
-          push(resource.src || resource.url)
-        }
-      }
+      pushBestFromArray(resources)
 
+      // Generic fallback: only scan keys that look like media fields.
       for (const [key, value] of Object.entries(node)) {
         if (/avatar|profile|owner|user|comment|like|share|icon|logo|emoji/i.test(key)) continue
-        if (/image|photo|display|thumbnail|carousel|sidecar|children|media|url/i.test(key)) {
+        if (/image|photo|display|thumbnail|carousel|sidecar|children|media|url|src/i.test(key)) {
           scanNode(value, depth + 1)
         }
       }
@@ -428,13 +434,28 @@ function extractInstagramCarouselImages(raw) {
     scanNode(item)
   }
 
-  return unique(output).slice(0, 20)
+  return unique(output).slice(0, 30)
 }
+
 
 function firstItemKeys(raw) {
   const first = flattenItems(raw)[0]
   if (!first || typeof first !== "object" || Array.isArray(first)) return []
   return Object.keys(first).slice(0, 50)
+}
+
+function firstItemMediaSummary(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return {}
+
+  return {
+    displayUrlType: typeof first.displayUrl,
+    displayUrlSample: typeof first.displayUrl === "string" ? first.displayUrl.slice(0, 120) : "",
+    imagesType: Array.isArray(first.images) ? "array" : typeof first.images,
+    imagesLength: Array.isArray(first.images) ? first.images.length : 0,
+    childPostsType: Array.isArray(first.childPosts) ? "array" : typeof first.childPosts,
+    childPostsLength: Array.isArray(first.childPosts) ? first.childPosts.length : 0
+  }
 }
 
 function extractInstagramShortcode(value) {
@@ -729,6 +750,19 @@ function detectPlatform(value) {
   }
 }
 
+function isSafeProviderImageUrl(url) {
+  const value = String(url || "").toLowerCase()
+  if (!value.startsWith("http")) return false
+
+  if (/mime_type=audio|audio_mpeg|audio_mp4|\.mp3(\?|$)|\.m4a(\?|$)|\.ogg(\?|$)|\.wav(\?|$)/.test(value)) return false
+  if (/mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.webm(\?|$)|\.mov(\?|$)/.test(value)) return false
+  if (/avatar|profile|emoji|icon|logo|sprite|glyph|favicon|rsrc\.php/.test(value)) return false
+
+  return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) ||
+    /scontent|cdninstagram|fbcdn|instagram|display|image|photo|media/.test(value)
+}
+
+
 function isValidImageForPlatform(url, platform) {
   const value = String(url || "").toLowerCase()
   if (!value.startsWith("http")) return false
@@ -747,9 +781,12 @@ function isValidImageForPlatform(url, platform) {
   }
 
   if (platform === "instagram") {
-    if (!/(scontent|cdninstagram|fbcdn)/.test(value)) return false
     if (/static\.cdninstagram|sprite|glyph|favicon|logo|profile|avatar|rsrc\.php/.test(value)) return false
-    return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) || /image|photo/.test(value)
+    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
+
+    return /(scontent|cdninstagram|fbcdn|instagram)/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) ||
+      /image|photo|display|media/.test(value)
   }
 
   return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) || /image|photo/.test(value)
