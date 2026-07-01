@@ -264,8 +264,10 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
   for (const item of flattenItems(raw)) {
     for (const field of [
       "images", "imageUrls", "image_urls", "photos", "slides", "carouselMedia",
-      "carousel_media", "displayResources", "display_resources", "urlList",
-      "url_list"
+      "carousel_media", "carousel_media_edges", "edge_sidecar_to_children",
+      "childPosts", "child_posts", "sidecarChildren", "sidecar_children",
+      "displayResources", "display_resources", "displayUrl", "display_url",
+      "thumbnailUrl", "thumbnail_url", "urlList", "url_list"
     ]) {
       const value = item?.[field]
       if (Array.isArray(value)) {
@@ -279,8 +281,13 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     }
   }
 
+  const rejectedImages = []
   const uniqueImages = unique(imageUrls)
-    .filter((item) => isValidImageForPlatform(item, platform))
+    .filter((item) => {
+      const ok = isValidImageForPlatform(item, platform)
+      if (!ok) rejectedImages.push(item)
+      return ok
+    })
     .slice(0, 12)
 
   const slides = uniqueImages.map((item, index) => ({
@@ -295,8 +302,9 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     audioUrls.length && !videoUrls.length ? "audio" :
       "video"
 
+  const pickedThumbnail = pickThumbnail(raw, platform)
   const thumbnail = firstClean([
-    pickThumbnail(raw),
+    isValidImageForPlatform(pickedThumbnail, platform) ? pickedThumbnail : "",
     slides[0]?.thumbnail,
     ...uniqueImages
   ]) || fallbackThumbnail(platform, kind)
@@ -314,6 +322,8 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     rawDebug: {
       provider: providerPayload?.provider || "unknown",
       imageCount: uniqueImages.length,
+      rejectedImageCount: rejectedImages.length,
+      rejectedImageSamples: rejectedImages.slice(0, 3),
       videoCount: unique(videoUrls).length,
       audioCount: unique(audioUrls).length
     },
@@ -364,7 +374,7 @@ function pickTitle(raw) {
   return ""
 }
 
-function pickThumbnail(raw) {
+function pickThumbnail(raw, platform) {
   const items = flattenItems(raw)
   for (const item of items) {
     const fields = [
@@ -383,7 +393,7 @@ function pickThumbnail(raw) {
 
     for (const field of fields) {
       const clean = cleanMediaUrl(field)
-      if (clean) return clean
+      if (clean && isValidImageForPlatform(clean, platform)) return clean
     }
   }
   return ""
@@ -423,7 +433,7 @@ async function fetchTikTokData(url, kind) {
       if (normalized.slides.length || normalized.thumbnail) {
         return {
           title: normalized.title,
-          thumbnail: normalized.thumbnail,
+          thumbnail: isValidImageForPlatform(normalized.thumbnail, "tiktok") ? normalized.thumbnail : normalized.slides[0]?.thumbnail || "",
           slides: normalized.slides
         }
       }
@@ -610,27 +620,37 @@ function isValidImageForPlatform(url, platform) {
   const value = String(url || "").toLowerCase()
   if (!value.startsWith("http")) return false
 
+  // Hard reject non-image media that some providers put inside "thumbnail" or mixed URL fields.
+  if (/mime_type=audio|audio_mpeg|audio_mp4|\.mp3(\?|$)|\.m4a(\?|$)|\.ogg(\?|$)|\.wav(\?|$)/.test(value)) return false
+  if (/mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.webm(\?|$)|\.mov(\?|$)/.test(value)) return false
+  if (/\/video\/tos\//.test(value)) return false
+
   if (platform === "tiktok") {
     if (!/(tiktokcdn|muscdn|byteimg)/.test(value)) return false
     if (/avatar|profile|emoji|icon|logo|tos-maliva-avt/.test(value)) return false
+
+    // TikTok photo-mode images usually contain these markers.
+    return /photomode|tplv-photomode|image|\.jpg(\?|$)|\.jpeg(\?|$)|\.png(\?|$)|\.webp(\?|$)|\.avif(\?|$)/.test(value)
   }
 
   if (platform === "instagram") {
     if (!/(scontent|cdninstagram|fbcdn)/.test(value)) return false
     if (/static\.cdninstagram|sprite|glyph|favicon|logo|profile|avatar|rsrc\.php/.test(value)) return false
+    return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) || /image|photo/.test(value)
   }
 
-  return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) || /image|photo|tos-/.test(value)
+  return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) || /image|photo/.test(value)
 }
 
 function isLikelyVideoUrl(url) {
   const value = String(url || "").toLowerCase()
-  return /\.(mp4|webm|mov|m3u8)(\?|$)/.test(value) || /video|playaddr|downloadaddr/.test(value)
+  if (/mime_type=audio|audio_mpeg|audio_mp4|\.mp3(\?|$)|\.m4a(\?|$)|\.ogg(\?|$)|\.wav(\?|$)|\.opus(\?|$)/.test(value)) return false
+  return /\.(mp4|webm|mov|m3u8)(\?|$)/.test(value) || /mime_type=video|playaddr|downloadaddr/.test(value)
 }
 
 function isLikelyAudioUrl(url) {
   const value = String(url || "").toLowerCase()
-  return /\.(mp3|m4a|wav|ogg|opus)(\?|$)/.test(value)
+  return /mime_type=audio|audio_mpeg|audio_mp4|\.(mp3|m4a|wav|ogg|opus)(\?|$)/.test(value)
 }
 
 function firstClean(values) {

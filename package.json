@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "7.0.0-provider-api-system",
+  "version": "7.0.2-provider-media-filter",
   "type": "module",
   "private": true,
   "scripts": {
