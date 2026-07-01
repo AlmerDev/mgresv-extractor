@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.49.1-noble
+FROM node:20-alpine
 
 ENV NODE_ENV=production
 ENV PORT=8080

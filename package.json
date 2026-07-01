@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "6.0.2-materialized-images",
+  "version": "6.0.5-memory-lite",
   "type": "module",
   "private": true,
   "scripts": {
@@ -11,7 +11,6 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "helmet": "^7.1.0",
-    "nanoid": "^5.0.7",
-    "playwright": "1.49.1"
+    "nanoid": "^5.0.7"
   }
 }
