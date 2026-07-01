@@ -6,7 +6,19 @@ import { nanoid } from "nanoid"
 const app = express()
 const PORT = Number(process.env.PORT || 8080)
 const TOKEN = process.env.EXTRACTOR_TOKEN || ""
-const MAX_FETCH_MS = Number(process.env.MAX_FETCH_MS || 12000)
+const MAX_FETCH_MS = Number(process.env.MAX_FETCH_MS || 25000)
+const PROVIDER_MODE = String(process.env.PROVIDER_MODE || "auto").toLowerCase()
+
+const APIFY_TOKEN = process.env.APIFY_TOKEN || ""
+const APIFY_TIKTOK_ACTOR = process.env.APIFY_TIKTOK_ACTOR || "clockworks/tiktok-scraper"
+const APIFY_INSTAGRAM_ACTOR = process.env.APIFY_INSTAGRAM_ACTOR || "apify/instagram-post-scraper"
+const APIFY_TIMEOUT_SECS = Number(process.env.APIFY_TIMEOUT_SECS || 45)
+
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || ""
+const RAPIDAPI_TIKTOK_HOST = process.env.RAPIDAPI_TIKTOK_HOST || ""
+const RAPIDAPI_TIKTOK_ENDPOINT = process.env.RAPIDAPI_TIKTOK_ENDPOINT || ""
+const RAPIDAPI_INSTAGRAM_HOST = process.env.RAPIDAPI_INSTAGRAM_HOST || ""
+const RAPIDAPI_INSTAGRAM_ENDPOINT = process.env.RAPIDAPI_INSTAGRAM_ENDPOINT || ""
 
 app.use(cors({ origin: "*" }))
 app.use(helmet({
@@ -19,15 +31,21 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "mgresv-extractor",
-    mode: "memory-lite",
-    engine: "no-browser extractor + oembed + metadata + platform json + strict photo/video routing",
+    mode: "provider-api-system",
+    engine: "provider API first + generic JSON normalizer + lite fallback",
+    providers: {
+      mode: PROVIDER_MODE,
+      apifyEnabled: Boolean(APIFY_TOKEN),
+      rapidapiEnabled: Boolean(RAPIDAPI_KEY),
+      tiktokRapidHost: Boolean(RAPIDAPI_TIKTOK_HOST),
+      instagramRapidHost: Boolean(RAPIDAPI_INSTAGRAM_HOST)
+    },
     supports: [
-      "no chromium memory crash",
-      "tiktok photo/video url detection",
-      "tiktok item detail json attempt",
-      "instagram post/reel routing",
-      "metadata thumbnail",
-      "safe fallback without fake video list"
+      "TikTok photo/video/provider extraction",
+      "Instagram post/provider extraction",
+      "provider JSON recursive URL parser",
+      "strict photo/video routing",
+      "no fake video list for known photo links"
     ]
   })
 })
@@ -44,7 +62,7 @@ app.post("/extract", async (req, res) => {
       return res.status(400).json({ ok: false, error: "URL tidak valid." })
     }
 
-    const result = await extractLite(inputUrl)
+    const result = await extractProviderFirst(inputUrl)
 
     return res.json({
       ok: true,
@@ -64,61 +82,311 @@ app.post("/extract", async (req, res) => {
   }
 })
 
-async function extractLite(inputUrl) {
+async function extractProviderFirst(inputUrl) {
   const resolvedUrl = await resolveFinalUrl(inputUrl)
   const platform = detectPlatform(resolvedUrl || inputUrl)
   const kind = detectKindFromUrl(resolvedUrl || inputUrl, platform) || "video"
 
-  const [meta, oembed, platformData] = await Promise.all([
-    fetchMetadata(resolvedUrl || inputUrl),
-    fetchOEmbed(resolvedUrl || inputUrl, platform),
-    fetchPlatformData(resolvedUrl || inputUrl, platform, kind)
-  ])
+  const attempts = []
 
-  let slides = platformData.slides || []
-
-  if (!slides.length && kind === "photo") {
-    const candidates = [
-      platformData.thumbnail,
-      oembed.thumbnail,
-      meta.thumbnail
-    ].filter(Boolean)
-
-    slides = unique(candidates)
-      .filter((item) => isValidImageForPlatform(item, platform))
-      .slice(0, 5)
-      .map((item, index) => ({
-        index,
-        type: "photo",
-        url: item,
-        thumbnail: item,
-        filename: `${platform || "photo"}-${index + 1}.${guessImageExt(item)}`
-      }))
+  if (PROVIDER_MODE === "auto" || PROVIDER_MODE === "rapidapi") {
+    attempts.push(() => extractViaRapidApi(resolvedUrl || inputUrl, platform, kind))
   }
 
-  const title = cleanTitle(platformData.title || oembed.title || meta.title || defaultTitle(platform, kind))
-  const thumbnail = platformData.thumbnail || oembed.thumbnail || meta.thumbnail || fallbackThumbnail(platform, kind)
+  if (PROVIDER_MODE === "auto" || PROVIDER_MODE === "apify") {
+    attempts.push(() => extractViaApify(resolvedUrl || inputUrl, platform, kind))
+  }
+
+  if (PROVIDER_MODE === "auto" || PROVIDER_MODE === "lite") {
+    attempts.push(() => extractLite(resolvedUrl || inputUrl, platform, kind))
+  }
+
+  const errors = []
+
+  for (const attempt of attempts) {
+    try {
+      const data = await attempt()
+      const normalized = normalizeProviderData(data, resolvedUrl || inputUrl, platform, kind)
+
+      if (normalized.slides.length || normalized.thumbnail || normalized.videoUrls.length) {
+        return normalized
+      }
+    } catch (error) {
+      errors.push(String(error?.message || error || "provider failed").slice(0, 160))
+    }
+  }
+
+  const fallback = fallbackResult(resolvedUrl || inputUrl, "no-provider-result")
+  fallback.rawDebug.errors = errors
+  return fallback
+}
+
+async function extractViaRapidApi(url, platform, kind) {
+  if (!RAPIDAPI_KEY) return null
+
+  let host = ""
+  let endpoint = ""
+
+  if (platform === "tiktok") {
+    host = RAPIDAPI_TIKTOK_HOST
+    endpoint = RAPIDAPI_TIKTOK_ENDPOINT
+  } else if (platform === "instagram") {
+    host = RAPIDAPI_INSTAGRAM_HOST
+    endpoint = RAPIDAPI_INSTAGRAM_ENDPOINT
+  }
+
+  if (!host || !endpoint) return null
+
+  const requestUrl = endpoint.includes("{url}")
+    ? endpoint.replaceAll("{url}", encodeURIComponent(url))
+    : endpoint.includes("?")
+      ? `${endpoint}&url=${encodeURIComponent(url)}`
+      : `${endpoint}?url=${encodeURIComponent(url)}`
+
+  const fullUrl = requestUrl.startsWith("http") ? requestUrl : `https://${host}${requestUrl.startsWith("/") ? "" : "/"}${requestUrl}`
+
+  const data = await fetchJson(fullUrl, {
+    "x-rapidapi-key": RAPIDAPI_KEY,
+    "x-rapidapi-host": host,
+    accept: "application/json,text/plain,*/*"
+  })
+
+  return {
+    provider: "rapidapi",
+    data
+  }
+}
+
+async function extractViaApify(url, platform, kind) {
+  if (!APIFY_TOKEN) return null
+
+  let actor = ""
+
+  if (platform === "tiktok") actor = APIFY_TIKTOK_ACTOR
+  if (platform === "instagram") actor = APIFY_INSTAGRAM_ACTOR
+
+  if (!actor) return null
+
+  const actorId = actor.replace("/", "~")
+
+  const inputs = buildApifyInputCandidates(url, platform)
+
+  for (const input of inputs) {
+    const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}&timeout=${APIFY_TIMEOUT_SECS}&memory=1024`
+
+    try {
+      const items = await fetchJson(endpoint, {
+        "content-type": "application/json"
+      }, {
+        method: "POST",
+        body: JSON.stringify(input),
+        timeoutMs: (APIFY_TIMEOUT_SECS + 10) * 1000
+      })
+
+      if (Array.isArray(items) && items.length) {
+        return {
+          provider: "apify",
+          input,
+          data: items
+        }
+      }
+    } catch {
+      // try next input shape
+    }
+  }
+
+  return null
+}
+
+function buildApifyInputCandidates(url, platform) {
+  if (platform === "tiktok") {
+    return [
+      { postURLs: [url], resultsPerPage: 1, shouldDownloadVideos: false, shouldDownloadCovers: false },
+      { startUrls: [{ url }], resultsPerPage: 1, shouldDownloadVideos: false, shouldDownloadCovers: false },
+      { urls: [url], resultsLimit: 1 }
+    ]
+  }
+
+  if (platform === "instagram") {
+    return [
+      { directUrls: [url], resultsType: "posts", resultsLimit: 1 },
+      { startUrls: [{ url }], resultsType: "posts", resultsLimit: 1 },
+      { urls: [url], resultsLimit: 1 }
+    ]
+  }
+
+  return [
+    { startUrls: [{ url }], resultsLimit: 1 },
+    { urls: [url], resultsLimit: 1 }
+  ]
+}
+
+async function extractLite(url, platform, kind) {
+  const [meta, oembed, platformData] = await Promise.all([
+    fetchMetadata(url),
+    fetchOEmbed(url, platform),
+    fetchPlatformData(url, platform, kind)
+  ])
+
+  return {
+    provider: "lite",
+    data: {
+      title: platformData.title || oembed.title || meta.title || "",
+      thumbnail: platformData.thumbnail || oembed.thumbnail || meta.thumbnail || "",
+      slides: platformData.slides || [],
+      videoUrls: [],
+      kind,
+      platform
+    }
+  }
+}
+
+function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) {
+  const raw = providerPayload?.data ?? providerPayload ?? {}
+  const title = pickTitle(raw) || defaultTitle(platform, knownKind)
+  const allUrls = []
+  const imageUrls = []
+  const videoUrls = []
+  const audioUrls = []
+
+  walkAny(raw, (value, key) => {
+    const clean = cleanMediaUrl(value)
+    if (!clean) return
+
+    allUrls.push(clean)
+
+    if (isValidImageForPlatform(clean, platform)) imageUrls.push(clean)
+    if (isLikelyVideoUrl(clean)) videoUrls.push(clean)
+    if (isLikelyAudioUrl(clean)) audioUrls.push(clean)
+  })
+
+  // Also support common explicit array fields.
+  for (const item of flattenItems(raw)) {
+    for (const field of [
+      "images", "imageUrls", "image_urls", "photos", "slides", "carouselMedia",
+      "carousel_media", "displayResources", "display_resources", "urlList",
+      "url_list"
+    ]) {
+      const value = item?.[field]
+      if (Array.isArray(value)) {
+        for (const child of value) {
+          walkAny(child, (url) => {
+            const clean = cleanMediaUrl(url)
+            if (clean && isValidImageForPlatform(clean, platform)) imageUrls.push(clean)
+          })
+        }
+      }
+    }
+  }
+
+  const uniqueImages = unique(imageUrls)
+    .filter((item) => isValidImageForPlatform(item, platform))
+    .slice(0, 12)
+
+  const slides = uniqueImages.map((item, index) => ({
+    index,
+    type: "photo",
+    url: item,
+    thumbnail: item,
+    filename: `${platform || "photo"}-${index + 1}.${guessImageExt(item)}`
+  }))
+
+  const kind = knownKind === "photo" || slides.length ? "photo" :
+    audioUrls.length && !videoUrls.length ? "audio" :
+      "video"
+
+  const thumbnail = firstClean([
+    pickThumbnail(raw),
+    slides[0]?.thumbnail,
+    ...uniqueImages
+  ]) || fallbackThumbnail(platform, kind)
 
   return {
     platform,
     kind,
     title,
     thumbnail,
-    source: resolvedUrl || inputUrl,
-    originalSource: inputUrl,
-    resolvedSource: resolvedUrl || inputUrl,
+    source: sourceUrl,
+    originalSource: sourceUrl,
+    resolvedSource: sourceUrl,
     slides,
+    videoUrls: unique(videoUrls).slice(0, 5),
     rawDebug: {
-      mode: "memory-lite",
-      slideCount: slides.length,
-      thumbnailSource: platformData.thumbnail ? "platform" : oembed.thumbnail ? "oembed" : meta.thumbnail ? "metadata" : "fallback"
+      provider: providerPayload?.provider || "unknown",
+      imageCount: uniqueImages.length,
+      videoCount: unique(videoUrls).length,
+      audioCount: unique(audioUrls).length
     },
     meta: {
-      ogType: meta.ogType || "",
+      ogType: "",
       hasVideo: kind === "video",
       hasImage: kind === "photo"
     }
   }
+}
+
+function flattenItems(raw) {
+  if (Array.isArray(raw)) return raw
+  if (Array.isArray(raw?.items)) return raw.items
+  if (Array.isArray(raw?.data)) return raw.data
+  if (Array.isArray(raw?.result)) return raw.result
+  if (Array.isArray(raw?.results)) return raw.results
+  return [raw]
+}
+
+function walkAny(node, onString, key = "") {
+  if (!node) return
+
+  if (typeof node === "string") {
+    onString(node, key)
+    return
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) walkAny(item, onString, key)
+    return
+  }
+
+  if (typeof node === "object") {
+    for (const [childKey, childValue] of Object.entries(node)) {
+      if (/avatar|profilePic|profile_pic|authorAvatar|userAvatar|icon|emoji|logo/i.test(childKey)) continue
+      walkAny(childValue, onString, childKey)
+    }
+  }
+}
+
+function pickTitle(raw) {
+  const items = flattenItems(raw)
+  for (const item of items) {
+    const value = item?.title || item?.caption || item?.desc || item?.description || item?.text || item?.shortcode
+    if (typeof value === "string" && value.trim()) return cleanTitle(value)
+  }
+  return ""
+}
+
+function pickThumbnail(raw) {
+  const items = flattenItems(raw)
+  for (const item of items) {
+    const fields = [
+      item?.thumbnail,
+      item?.thumbnailUrl,
+      item?.thumbnail_url,
+      item?.cover,
+      item?.coverUrl,
+      item?.cover_url,
+      item?.displayUrl,
+      item?.display_url,
+      item?.image,
+      item?.imageUrl,
+      item?.image_url
+    ]
+
+    for (const field of fields) {
+      const clean = cleanMediaUrl(field)
+      if (clean) return clean
+    }
+  }
+  return ""
 }
 
 async function fetchPlatformData(url, platform, kind) {
@@ -147,102 +415,24 @@ async function fetchTikTokData(url, kind) {
 
   for (const endpoint of endpoints) {
     try {
-      const data = await fetchJson(endpoint, url)
-
-      if (!data) continue
-
-      const item = findTikTokItem(data)
-      const title = item?.desc || item?.contents?.[0]?.desc || ""
-
-      const imageUrls = extractTikTokImagePostUrls(item || data)
-      const cover = firstClean([
-        item?.video?.cover,
-        item?.video?.originCover,
-        item?.video?.dynamicCover,
-        item?.imagePost?.cover?.urlList?.[0],
-        imageUrls[0]
-      ])
-
-      if (imageUrls.length || cover) {
+      const data = await fetchJson(endpoint, {
+        ...browserHeaders(url),
+        accept: "application/json,text/plain,*/*"
+      })
+      const normalized = normalizeProviderData({ provider: "tiktok-item-detail", data }, url, "tiktok", kind)
+      if (normalized.slides.length || normalized.thumbnail) {
         return {
-          title,
-          thumbnail: cover || imageUrls[0] || "",
-          slides: imageUrls.slice(0, 10).map((item, index) => ({
-            index,
-            type: "photo",
-            url: item,
-            thumbnail: item,
-            filename: `tiktok-${index + 1}.${guessImageExt(item)}`
-          }))
+          title: normalized.title,
+          thumbnail: normalized.thumbnail,
+          slides: normalized.slides
         }
       }
     } catch {
-      // try next endpoint
+      // try next
     }
   }
 
   return { title: "", thumbnail: "", slides: [] }
-}
-
-function findTikTokItem(data) {
-  if (!data || typeof data !== "object") return null
-  if (data.itemInfo?.itemStruct) return data.itemInfo.itemStruct
-  if (data.itemStruct) return data.itemStruct
-  if (data.item) return data.item
-  return null
-}
-
-function extractTikTokImagePostUrls(data) {
-  const urls = []
-
-  function push(value) {
-    const clean = cleanMediaUrl(value)
-    if (clean && isValidImageForPlatform(clean, "tiktok")) urls.push(clean)
-  }
-
-  const item = findTikTokItem(data) || data
-  const images = item?.imagePost?.images
-
-  if (Array.isArray(images)) {
-    for (const image of images) {
-      const imageUrl = image?.imageURL || image?.imageUrl || image?.image_url || {}
-      const list = imageUrl.urlList || imageUrl.url_list || []
-
-      if (Array.isArray(list) && list.length) {
-        push(list[0])
-      }
-
-      push(imageUrl.uri)
-    }
-  }
-
-  walkJsonForImages(item, urls, "tiktok")
-
-  return unique(urls).slice(0, 10)
-}
-
-function walkJsonForImages(node, output, platform) {
-  if (!node) return
-
-  if (typeof node === "string") {
-    const clean = cleanMediaUrl(node)
-    if (clean && isValidImageForPlatform(clean, platform)) output.push(clean)
-    return
-  }
-
-  if (Array.isArray(node)) {
-    for (const item of node) walkJsonForImages(item, output, platform)
-    return
-  }
-
-  if (typeof node === "object") {
-    for (const [key, value] of Object.entries(node)) {
-      if (/avatar|profile|icon|logo|emoji/i.test(key)) continue
-      if (/image|photo|cover|urlList|url_list|display/i.test(key)) {
-        walkJsonForImages(value, output, platform)
-      }
-    }
-  }
 }
 
 async function fetchMetadata(url) {
@@ -276,11 +466,12 @@ async function fetchOEmbed(url, platform) {
     endpoints.push(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`)
   }
 
-  if (!endpoints.length) return { title: "", thumbnail: "" }
-
   for (const endpoint of endpoints) {
     try {
-      const data = await fetchJson(endpoint, url)
+      const data = await fetchJson(endpoint, {
+        ...browserHeaders(url),
+        accept: "application/json,text/plain,*/*"
+      })
       if (data?.thumbnail_url || data?.title) {
         return {
           title: data.title || "",
@@ -296,58 +487,48 @@ async function fetchOEmbed(url, platform) {
 }
 
 async function resolveFinalUrl(url) {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), MAX_FETCH_MS)
-
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: "GET",
       redirect: "follow",
-      headers: browserHeaders(url),
-      signal: controller.signal
+      headers: browserHeaders(url)
     })
     return response.url || url
   } catch {
     return url
-  } finally {
-    clearTimeout(timeout)
   }
 }
 
 async function fetchText(url) {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), MAX_FETCH_MS)
-
-  try {
-    const response = await fetch(url, {
-      headers: browserHeaders(url),
-      redirect: "follow",
-      signal: controller.signal
-    })
-
-    if (!response.ok) throw new Error(`Fetch failed: ${response.status}`)
-    return await response.text()
-  } finally {
-    clearTimeout(timeout)
-  }
+  const response = await fetchWithTimeout(url, {
+    headers: browserHeaders(url),
+    redirect: "follow"
+  })
+  if (!response.ok) throw new Error(`Fetch failed: ${response.status}`)
+  return await response.text()
 }
 
-async function fetchJson(url, referer) {
+async function fetchJson(url, headers = {}, options = {}) {
+  const response = await fetchWithTimeout(url, {
+    method: options.method || "GET",
+    headers,
+    redirect: "follow",
+    body: options.body
+  }, options.timeoutMs || MAX_FETCH_MS)
+
+  if (!response.ok) throw new Error(`Fetch JSON failed: ${response.status}`)
+  return await response.json()
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = MAX_FETCH_MS) {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), MAX_FETCH_MS)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
-    const response = await fetch(url, {
-      headers: {
-        ...browserHeaders(referer || url),
-        accept: "application/json,text/plain,*/*"
-      },
-      redirect: "follow",
+    return await fetch(url, {
+      ...options,
       signal: controller.signal
     })
-
-    if (!response.ok) throw new Error(`Fetch JSON failed: ${response.status}`)
-    return await response.json()
   } finally {
     clearTimeout(timeout)
   }
@@ -442,6 +623,16 @@ function isValidImageForPlatform(url, platform) {
   return /\.(jpg|jpeg|png|webp|avif)(\?|$)/.test(value) || /image|photo|tos-/.test(value)
 }
 
+function isLikelyVideoUrl(url) {
+  const value = String(url || "").toLowerCase()
+  return /\.(mp4|webm|mov|m3u8)(\?|$)/.test(value) || /video|playaddr|downloadaddr/.test(value)
+}
+
+function isLikelyAudioUrl(url) {
+  const value = String(url || "").toLowerCase()
+  return /\.(mp3|m4a|wav|ogg|opus)(\?|$)/.test(value)
+}
+
 function firstClean(values) {
   for (const value of values) {
     const clean = cleanMediaUrl(value)
@@ -462,7 +653,7 @@ function fallbackResult(inputUrl, reason = "fallback") {
     originalSource: inputUrl,
     resolvedSource: inputUrl,
     slides: [],
-    rawDebug: { mode: "memory-lite", fallbackReason: reason },
+    rawDebug: { mode: "provider-api-system", fallbackReason: reason },
     meta: {
       ogType: "",
       hasVideo: kind === "video",
@@ -595,10 +786,10 @@ function browserHeaders(referer) {
 
 function simplifyError(message) {
   const msg = String(message || "").replace(/\s+/g, " ").trim()
-  if (/timeout|aborted/i.test(msg)) return "Extractor timeout."
+  if (/timeout|aborted/i.test(msg)) return "Provider extractor timeout."
   return msg.slice(0, 300) || "Extract gagal."
 }
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`MgreSV memory-lite extractor running on ${PORT}`)
+  console.log(`MgreSV provider extractor running on ${PORT}`)
 })

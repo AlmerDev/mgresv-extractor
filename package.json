@@ -1,6 +1,6 @@
 {
   "name": "mgresv-extractor",
-  "version": "6.0.5-memory-lite",
+  "version": "7.0.0-provider-api-system",
   "type": "module",
   "private": true,
   "scripts": {
