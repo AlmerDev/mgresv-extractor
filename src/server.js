@@ -16,9 +16,6 @@ const APIFY_FACEBOOK_ACTOR = process.env.APIFY_FACEBOOK_ACTOR || ""
 const APIFY_X_ACTOR = process.env.APIFY_X_ACTOR || "apidojo/tweet-scraper"
 const APIFY_THREADS_ACTOR = process.env.APIFY_THREADS_ACTOR || "automation-lab/threads-scraper"
 const APIFY_PINTEREST_ACTOR = process.env.APIFY_PINTEREST_ACTOR || "danielmilevski9/pinterest-crawler"
-const APIFY_REDDIT_ACTOR = process.env.APIFY_REDDIT_ACTOR || "trudax/reddit-scraper"
-const APIFY_VIMEO_ACTOR = process.env.APIFY_VIMEO_ACTOR || ""
-const APIFY_SOUNDCLOUD_ACTOR = process.env.APIFY_SOUNDCLOUD_ACTOR || ""
 const APIFY_TIMEOUT_SECS = Number(process.env.APIFY_TIMEOUT_SECS || 45)
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || ""
@@ -49,10 +46,7 @@ app.get("/health", (req, res) => {
       facebookActorEnabled: Boolean(APIFY_FACEBOOK_ACTOR),
       xActorEnabled: Boolean(APIFY_X_ACTOR),
       threadsActorEnabled: Boolean(APIFY_THREADS_ACTOR),
-      pinterestActorEnabled: Boolean(APIFY_PINTEREST_ACTOR),
-      redditActorEnabled: Boolean(APIFY_REDDIT_ACTOR),
-      vimeoActorEnabled: Boolean(APIFY_VIMEO_ACTOR),
-      soundcloudActorEnabled: Boolean(APIFY_SOUNDCLOUD_ACTOR)
+      pinterestActorEnabled: Boolean(APIFY_PINTEREST_ACTOR)
     },
     supports: [
       "TikTok photo/video/provider extraction",
@@ -99,7 +93,8 @@ app.post("/extract", async (req, res) => {
 async function extractProviderFirst(inputUrl) {
   const resolvedUrl = await resolveFinalUrl(inputUrl)
   const platform = detectPlatform(resolvedUrl || inputUrl)
-  const kind = detectKindFromUrl(resolvedUrl || inputUrl, platform) || "video"
+  const detectedKind = detectKindFromUrl(resolvedUrl || inputUrl, platform)
+  const kind = detectedKind || (["pinterest", "x", "threads"].includes(platform) ? "mixed" : "video")
 
   const attempts = []
 
@@ -182,9 +177,6 @@ async function extractViaApify(url, platform, kind) {
   if (platform === "x") actor = APIFY_X_ACTOR
   if (platform === "threads") actor = APIFY_THREADS_ACTOR
   if (platform === "pinterest") actor = APIFY_PINTEREST_ACTOR
-  if (platform === "reddit") actor = APIFY_REDDIT_ACTOR
-  if (platform === "vimeo") actor = APIFY_VIMEO_ACTOR
-  if (platform === "soundcloud") actor = APIFY_SOUNDCLOUD_ACTOR
 
   if (!actor) return null
 
@@ -242,39 +234,6 @@ function buildApifyInputCandidates(url, platform) {
     ].filter(Boolean)
   }
 
-
-  if (platform === "x") {
-    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
-    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
-    return /(pbs\.twimg|twimg|x\.com|twitter\.com)/.test(value) ||
-      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
-      /image|photo|picture|media/.test(value)
-  }
-
-  if (platform === "threads") {
-    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
-    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
-    return /(cdninstagram|fbcdn|scontent|threads)/.test(value) ||
-      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
-      /image|photo|picture|media/.test(value)
-  }
-
-  if (platform === "pinterest") {
-    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
-    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
-    return /(pinimg|pinterest|pin\.it)/.test(value) ||
-      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
-      /image|photo|picture|media/.test(value)
-  }
-
-  if (platform === "reddit") {
-    if (/profile|avatar|emoji|icon|logo|sprite/.test(value)) return false
-    if (/mime_type=audio|audio_mpeg|audio_mp4|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)|\.mp3(\?|$)|\.m4a(\?|$)/.test(value)) return false
-    return /(i\.redd\.it|preview\.redd\.it|redditmedia|redd\.it|imgur)/.test(value) ||
-      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
-      /image|photo|picture|media/.test(value)
-  }
-
   if (platform === "facebook") {
     return [
       { startUrls: [{ url }], resultsLimit: 1 },
@@ -282,6 +241,37 @@ function buildApifyInputCandidates(url, platform) {
       { urls: [url], resultsLimit: 1 },
       { url, resultsLimit: 1 },
       { directUrls: [url], resultsLimit: 1 }
+    ]
+  }
+
+  if (platform === "x") {
+    const tweetId = extractTweetId(url)
+    return [
+      tweetId ? { tweetIds: [tweetId], maxItems: 1 } : null,
+      { startUrls: [{ url }], maxItems: 1 },
+      { startUrls: [url], maxItems: 1 },
+      { urls: [url], maxItems: 1 },
+      { url, maxItems: 1 }
+    ].filter(Boolean)
+  }
+
+  if (platform === "threads") {
+    return [
+      { startUrls: [{ url }], resultsLimit: 1, maxItems: 1 },
+      { startUrls: [url], resultsLimit: 1, maxItems: 1 },
+      { urls: [url], resultsLimit: 1, maxItems: 1 },
+      { threadUrls: [url], resultsLimit: 1, maxItems: 1 },
+      { directUrls: [url], resultsLimit: 1, maxItems: 1 },
+      { url, resultsLimit: 1, maxItems: 1 }
+    ]
+  }
+
+  if (platform === "pinterest") {
+    return [
+      { startUrls: [{ url }], maxItems: 1 },
+      { startUrls: [url], maxItems: 1 },
+      { urls: [url], maxItems: 1 },
+      { url, maxItems: 1 }
     ]
   }
 
@@ -315,14 +305,17 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
   const raw = providerPayload?.data ?? providerPayload ?? {}
   const instagramExplicitImages = platform === "instagram" ? extractInstagramCarouselImages(raw) : []
   const facebookExplicitImages = platform === "facebook" ? extractFacebookPostImages(raw) : []
-  const socialExplicitImages = ["x", "threads", "pinterest", "reddit"].includes(platform) ? extractGenericPostImages(raw, platform) : []
+  const socialExplicitMedia = platform === "pinterest" ? extractPinterestMedia(raw) : ["x", "threads"].includes(platform) ? extractGenericPostMedia(raw, platform) : { imageUrls: [], videoUrls: [], audioUrls: [], source: "none" }
+  const socialExplicitImages = socialExplicitMedia.imageUrls || []
+  const tiktokPhotoMode = platform === "tiktok" && knownKind === "photo"
+  const tiktokExplicitImages = tiktokPhotoMode ? extractTikTokPhotoImages(raw) : []
   const title = pickTitle(raw) || defaultTitle(platform, knownKind)
   const allUrls = []
   const imageUrls = []
   const videoUrls = []
   const audioUrls = []
 
-  if (!["instagram", "facebook", "x", "threads", "pinterest", "reddit"].includes(platform)) walkAny(raw, (value, key) => {
+  if (!["instagram", "facebook", "x", "threads", "pinterest"].includes(platform) && !tiktokPhotoMode) walkAny(raw, (value, key) => {
     const clean = cleanMediaUrl(value)
     if (!clean) return
 
@@ -345,8 +338,20 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     imageUrls.push(image)
   }
 
+  for (const image of tiktokExplicitImages) {
+    imageUrls.push(image)
+  }
+
+  for (const video of socialExplicitMedia.videoUrls || []) {
+    videoUrls.push(video)
+  }
+
+  for (const audio of socialExplicitMedia.audioUrls || []) {
+    audioUrls.push(audio)
+  }
+
   // Also support common explicit array fields.
-  if (!["instagram", "facebook", "x", "threads", "pinterest", "reddit"].includes(platform)) for (const item of flattenItems(raw)) {
+  if (!["instagram", "facebook", "x", "threads", "pinterest"].includes(platform) && !tiktokPhotoMode) for (const item of flattenItems(raw)) {
     for (const field of [
       "images", "imageUrls", "image_urls", "photos", "slides", "carouselMedia",
       "carousel_media", "carousel_media_edges", "edge_sidecar_to_children",
@@ -375,6 +380,14 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     })
     .slice(0, 12)
 
+  const uniqueVideos = unique(videoUrls)
+    .filter((item) => isLikelyVideoUrl(item))
+    .slice(0, 5)
+
+  const uniqueAudios = unique(audioUrls)
+    .filter((item) => isLikelyAudioUrl(item))
+    .slice(0, 5)
+
   const slides = uniqueImages.map((item, index) => ({
     index,
     type: "photo",
@@ -383,12 +396,17 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     filename: `${platform || "photo"}-${index + 1}.${guessImageExt(item)}`
   }))
 
-  const kind = knownKind === "photo" || slides.length ? "photo" :
-    audioUrls.length && !videoUrls.length ? "audio" :
-      "video"
+  const kind = uniqueVideos.length ? "video" :
+    uniqueAudios.length && !slides.length ? "audio" :
+      knownKind === "photo" || slides.length ? "photo" :
+        "video"
 
   const pickedThumbnail = pickThumbnail(raw, platform)
-  const thumbnail = firstClean([
+  const thumbnail = firstClean(tiktokPhotoMode ? [
+    slides[0]?.thumbnail,
+    ...uniqueImages,
+    isValidImageForPlatform(pickedThumbnail, platform) ? pickedThumbnail : ""
+  ] : [
     isValidImageForPlatform(pickedThumbnail, platform) ? pickedThumbnail : "",
     slides[0]?.thumbnail,
     ...uniqueImages
@@ -403,8 +421,8 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     originalSource: sourceUrl,
     resolvedSource: sourceUrl,
     slides,
-    videoUrls: unique(videoUrls).slice(0, 5),
-    audioUrls: unique(audioUrls).slice(0, 5),
+    videoUrls: uniqueVideos,
+    audioUrls: uniqueAudios,
     rawDebug: {
       provider: providerPayload?.provider || "unknown",
       imageCount: uniqueImages.length,
@@ -415,10 +433,14 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
       facebookExplicitCount: typeof facebookExplicitImages !== "undefined" ? facebookExplicitImages.length : 0,
       facebookSlideSource: facebookSlideSource(raw),
       socialExplicitCount: typeof socialExplicitImages !== "undefined" ? socialExplicitImages.length : 0,
+      socialVideoExplicitCount: socialExplicitMedia?.videoUrls?.length || 0,
+      socialMediaSource: socialExplicitMedia?.source || "none",
+      tiktokExplicitCount: typeof tiktokExplicitImages !== "undefined" ? tiktokExplicitImages.length : 0,
+      tiktokSlideSource: tiktokSlideSource(raw),
       firstItemKeys: firstItemKeys(raw),
       firstItemMediaSummary: firstItemMediaSummary(raw),
-      videoCount: unique(videoUrls).length,
-      audioCount: unique(audioUrls).length
+      videoCount: uniqueVideos.length,
+      audioCount: uniqueAudios.length
     },
     meta: {
       ogType: "",
@@ -426,6 +448,130 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
       hasImage: kind === "photo"
     }
   }
+}
+
+
+function extractTikTokPhotoImages(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return []
+
+  const itemStruct = first.itemStruct ||
+    first.itemInfo?.itemStruct ||
+    first.data?.itemInfo?.itemStruct ||
+    first.item ||
+    first.video ||
+    first
+
+  const imagePost = itemStruct?.imagePost ||
+    itemStruct?.image_post ||
+    first.imagePost ||
+    first.image_post ||
+    first.photoMode ||
+    first.photo_mode ||
+    null
+
+  const orderedSources = [
+    imagePost?.images,
+    imagePost?.imageList,
+    imagePost?.image_list,
+    itemStruct?.imagePost?.images,
+    itemStruct?.image_post?.images,
+    first.slideshowImageUrls,
+    first.slideshow_image_urls,
+    first.carouselImages,
+    first.carousel_images,
+    first.photoUrls,
+    first.photo_urls,
+    first.imageUrls,
+    first.image_urls,
+    first.images,
+    first.photos,
+    first.slides
+  ]
+
+  for (const source of orderedSources) {
+    const collected = collectTikTokPhotoImages(source)
+    if (collected.length) return unique(collected).slice(0, 20)
+  }
+
+  return []
+}
+
+function collectTikTokPhotoImages(node, depth = 0) {
+  const output = []
+  if (!node || depth > 6) return output
+
+  function push(value) {
+    const clean = cleanMediaUrl(value)
+    if (clean && isValidImageForPlatform(clean, "tiktok")) output.push(clean)
+  }
+
+  if (typeof node === "string") {
+    push(node)
+    return output
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) output.push(...collectTikTokPhotoImages(item, depth + 1))
+    return output
+  }
+
+  if (typeof node !== "object") return output
+
+  push(node.url)
+  push(node.src)
+  push(node.image)
+  push(node.imageUrl)
+  push(node.image_url)
+  push(node.displayUrl)
+  push(node.display_url)
+  push(node.downloadUrl)
+  push(node.download_url)
+
+  const urlArrays = [
+    node.urlList,
+    node.url_list,
+    node.urls,
+    node.imageURL?.urlList,
+    node.imageURL?.url_list,
+    node.imageUrl?.urlList,
+    node.image_url?.url_list,
+    node.displayImage?.urlList,
+    node.display_image?.url_list,
+    node.image?.urlList,
+    node.image?.url_list
+  ]
+
+  for (const arr of urlArrays) {
+    if (!Array.isArray(arr)) continue
+    for (const item of arr) push(item)
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    // Keep this walker strict. TikTok provider payloads often contain covers,
+    // author avatars, stickers, music thumbnails, and recommended/related images.
+    if (/avatar|profile|author|owner|user|music|sound|audio|cover|dynamic|origin|icon|logo|emoji|sticker|effect|ad|recommend|related|suggest/i.test(key)) continue
+    if (/imagepost|image_post|imageurl|image_url|imagelist|image_list|images|photo|photos|slide|slides|carousel|urlList|url_list/i.test(key)) {
+      output.push(...collectTikTokPhotoImages(value, depth + 1))
+    }
+  }
+
+  return output
+}
+
+function tiktokSlideSource(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return "none"
+  const itemStruct = first.itemStruct || first.itemInfo?.itemStruct || first.data?.itemInfo?.itemStruct || first.item || first.video || first
+  if (itemStruct?.imagePost?.images || itemStruct?.image_post?.images || first.imagePost?.images || first.image_post?.images) return "imagePost.images"
+  if (first.slideshowImageUrls || first.slideshow_image_urls) return "slideshowImageUrls"
+  if (first.carouselImages || first.carousel_images) return "carouselImages"
+  if (first.photoUrls || first.photo_urls) return "photoUrls"
+  if (first.imageUrls || first.image_urls) return "imageUrls"
+  if (first.images) return "images"
+  if (first.photos) return "photos"
+  if (first.slides) return "slides"
+  return "none"
 }
 
 function extractInstagramCarouselImages(raw) {
@@ -615,6 +761,254 @@ function facebookSlideSource(raw) {
   return "none"
 }
 
+
+
+function extractPinterestMedia(raw) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object") return { imageUrls: [], videoUrls: [], audioUrls: [], source: "none" }
+
+  const sources = [
+    ["videoUrl", first.videoUrl],
+    ["video_url", first.video_url],
+    ["video", first.video],
+    ["videos", first.videos],
+    ["videoList", first.videoList],
+    ["video_list", first.video_list],
+    ["storyPinData", first.storyPinData],
+    ["story_pin_data", first.story_pin_data],
+    ["carouselData", first.carouselData],
+    ["carousel_data", first.carousel_data],
+    ["images", first.images],
+    ["image", first.image],
+    ["imageUrl", first.imageUrl],
+    ["image_url", first.image_url],
+    ["imageLargeUrl", first.imageLargeUrl],
+    ["image_large_url", first.image_large_url],
+    ["media", first.media],
+    ["medias", first.medias],
+    ["pin", first.pin],
+    ["data", first.data],
+    ["root", first]
+  ]
+
+  const merged = { imageUrls: [], videoUrls: [], audioUrls: [], source: "none" }
+
+  for (const [sourceName, sourceValue] of sources) {
+    const collected = collectPinterestMedia(sourceValue, sourceName)
+    if (collected.videoUrls.length || collected.imageUrls.length) {
+      if (merged.source === "none") merged.source = sourceName
+      merged.imageUrls.push(...collected.imageUrls)
+      merged.videoUrls.push(...collected.videoUrls)
+      merged.audioUrls.push(...collected.audioUrls)
+    }
+  }
+
+  return {
+    imageUrls: unique(merged.imageUrls).slice(0, 12),
+    videoUrls: unique(merged.videoUrls).slice(0, 5),
+    audioUrls: unique(merged.audioUrls).slice(0, 5),
+    source: merged.source
+  }
+}
+
+function collectPinterestMedia(node, key = "", depth = 0) {
+  const output = { imageUrls: [], videoUrls: [], audioUrls: [] }
+  if (!node || depth > 10) return output
+
+  function merge(child) {
+    output.imageUrls.push(...child.imageUrls)
+    output.videoUrls.push(...child.videoUrls)
+    output.audioUrls.push(...child.audioUrls)
+  }
+
+  function push(value, fieldKey = key) {
+    const clean = cleanMediaUrl(value)
+    if (!clean) return
+
+    const lower = clean.toLowerCase()
+    const field = String(fieldKey || "").toLowerCase()
+
+    // Reject Pinterest page URLs. We only want CDN media URLs.
+    if (/pinterest\.[^/]+\/pin\//.test(lower) || /pin\.it\//.test(lower)) return
+    if (/avatar|profile|author|owner|user|icon|logo|emoji|sprite|favicon/.test(lower)) return
+
+    if (isLikelyAudioUrl(lower)) {
+      output.audioUrls.push(clean)
+      return
+    }
+
+    if (isLikelyVideoUrl(lower) || (/video|videos|hls|mp4|story/.test(field) && /pinimg|\.mp4|\.m3u8/.test(lower))) {
+      output.videoUrls.push(clean)
+      return
+    }
+
+    if (isValidImageForPlatform(clean, "pinterest")) {
+      output.imageUrls.push(clean)
+    }
+  }
+
+  if (typeof node === "string") {
+    push(node, key)
+    return output
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) merge(collectPinterestMedia(item, key, depth + 1))
+    return output
+  }
+
+  if (typeof node !== "object") return output
+
+  for (const field of [
+    "url", "src", "href", "image", "imageUrl", "image_url", "imageLargeUrl", "image_large_url",
+    "thumbnail", "thumbnailUrl", "thumbnail_url", "displayUrl", "display_url", "preview", "previewUrl", "preview_url",
+    "video", "videoUrl", "video_url", "videoSrc", "video_src", "mp4", "hls", "hlsUrl", "hls_url",
+    "orig", "original", "originals"
+  ]) {
+    push(node?.[field], field)
+  }
+
+  for (const [childKey, value] of Object.entries(node)) {
+    if (/avatar|profile|author|owner|user|comment|reply|reaction|like|icon|logo|emoji|tracking|promoted|ad/i.test(childKey)) continue
+    if (/video|media|image|photo|picture|thumbnail|preview|gallery|carousel|story|attachment|url|src|mp4|hls|orig|original/i.test(childKey)) {
+      merge(collectPinterestMedia(value, childKey, depth + 1))
+    }
+  }
+
+  return output
+}
+
+function extractGenericPostMedia(raw, platform) {
+  const first = flattenItems(raw)[0]
+  if (!first || typeof first !== "object") return { imageUrls: [], videoUrls: [], audioUrls: [], source: "none" }
+
+  const sources = [
+    ["videoVersions", first.videoVersions],
+    ["video_versions", first.video_versions],
+    ["videoUrl", first.videoUrl],
+    ["video_url", first.video_url],
+    ["video", first.video],
+    ["videos", first.videos],
+    ["media", first.media],
+    ["medias", first.medias],
+    ["attachments", first.attachments],
+    ["carouselMedia", first.carouselMedia],
+    ["carousel_media", first.carousel_media],
+    ["gallery", first.gallery],
+    ["galleryData", first.galleryData],
+    ["gallery_data", first.gallery_data],
+    ["images", first.images],
+    ["image", first.image],
+    ["photos", first.photos],
+    ["photo", first.photo],
+    ["pictures", first.pictures],
+    ["picture", first.picture],
+    ["displayUrl", first.displayUrl],
+    ["display_url", first.display_url],
+    ["thumbnail", first.thumbnail],
+    ["thumbnailUrl", first.thumbnailUrl],
+    ["thumbnail_url", first.thumbnail_url],
+    ["preview", first.preview],
+    ["url", first.url]
+  ]
+
+  const merged = { imageUrls: [], videoUrls: [], audioUrls: [], source: "none" }
+
+  for (const [sourceName, sourceValue] of sources) {
+    const collected = collectGenericMedia(sourceValue, platform, sourceName)
+
+    if (collected.videoUrls.length || collected.imageUrls.length || collected.audioUrls.length) {
+      if (merged.source === "none") merged.source = sourceName
+      merged.imageUrls.push(...collected.imageUrls)
+      merged.videoUrls.push(...collected.videoUrls)
+      merged.audioUrls.push(...collected.audioUrls)
+    }
+  }
+
+  return {
+    imageUrls: unique(merged.imageUrls).slice(0, 12),
+    videoUrls: unique(merged.videoUrls).slice(0, 5),
+    audioUrls: unique(merged.audioUrls).slice(0, 5),
+    source: merged.source
+  }
+}
+
+function collectGenericMedia(node, platform, key = "", depth = 0) {
+  const output = { imageUrls: [], videoUrls: [], audioUrls: [] }
+  if (!node || depth > 9) return output
+
+  function merge(child) {
+    output.imageUrls.push(...child.imageUrls)
+    output.videoUrls.push(...child.videoUrls)
+    output.audioUrls.push(...child.audioUrls)
+  }
+
+  function push(value, fieldKey = key) {
+    const clean = cleanMediaUrl(value)
+    if (!clean) return
+
+    const lowerKey = String(fieldKey || "").toLowerCase()
+
+    if (isLikelyAudioUrl(clean)) {
+      output.audioUrls.push(clean)
+      return
+    }
+
+    if (isLikelyVideoUrl(clean) || isLikelyVideoField(clean, lowerKey)) {
+      output.videoUrls.push(clean)
+      return
+    }
+
+    if (isValidImageForPlatform(clean, platform)) {
+      output.imageUrls.push(clean)
+    }
+  }
+
+  if (typeof node === "string") {
+    push(node, key)
+    return output
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) merge(collectGenericMedia(item, platform, key, depth + 1))
+    return output
+  }
+
+  if (typeof node !== "object") return output
+
+  for (const field of [
+    "url", "src", "href", "playUrl", "play_url", "downloadUrl", "download_url",
+    "mediaUrl", "media_url", "videoUrl", "video_url", "videoSrc", "video_src",
+    "hdUrl", "hd_url", "sdUrl", "sd_url", "dashUrl", "dash_url",
+    "image", "imageUrl", "image_url", "displayUrl", "display_url",
+    "thumbnail", "thumbnailUrl", "thumbnail_url", "previewUrl", "preview_url"
+  ]) {
+    push(node?.[field], field)
+  }
+
+  for (const [childKey, value] of Object.entries(node)) {
+    if (/avatar|profile|author|owner|user|comment|reply|reaction|like|icon|logo|emoji/i.test(childKey)) continue
+
+    if (/video|media|image|photo|picture|thumbnail|preview|gallery|attachment|url|src|play|download|dash/i.test(childKey)) {
+      merge(collectGenericMedia(value, platform, childKey, depth + 1))
+    }
+  }
+
+  return output
+}
+
+function isLikelyVideoField(url, key = "") {
+  const value = String(url || "").toLowerCase()
+  const field = String(key || "").toLowerCase()
+
+  if (!value.startsWith("http")) return false
+  if (isLikelyAudioUrl(value)) return false
+  if (/\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) || /mime_type=image|image_jpeg|image_webp|image|photo/.test(value)) return false
+  if (/thumbnail|thumb|cover|preview|image|photo|picture/.test(field)) return false
+  if (!/video|play|download|dash|hd|sd|media/.test(field)) return false
+
+  return /cdninstagram|fbcdn|fbsbx|scontent|twimg|video|mp4|m3u8|dash|play|download/.test(value)
+}
 
 function extractGenericPostImages(raw, platform) {
   const first = flattenItems(raw)[0]
@@ -1008,14 +1402,9 @@ function detectKindFromUrl(value, platform) {
       if (path.includes("/share/p/") || path.includes("/photo") || path.includes("/posts/") || path.includes("/permalink/") || path.includes("/story.php")) return "photo"
     }
 
-    if (platform === "x") return "video"
-    if (platform === "threads") return "photo"
-    if (platform === "pinterest") return "photo"
-    if (platform === "reddit") {
-      if (path.includes("/gallery/") || path.includes("/r/")) return "photo"
-    }
-    if (platform === "soundcloud") return "audio"
-    if (platform === "vimeo") return "video"
+    if (platform === "x") return null
+    if (platform === "threads") return null
+    if (platform === "pinterest") return null
 
     if (/\.(jpg|jpeg|png|webp|avif)$/.test(path)) return "photo"
     if (/\.(mp4|webm|mov|mkv)$/.test(path)) return "video"
@@ -1038,9 +1427,7 @@ function detectPlatform(value) {
     if (host.includes("twitter.com") || host.includes("x.com")) return "x"
     if (host.includes("threads.net")) return "threads"
     if (host.includes("pinterest.") || host.includes("pin.it")) return "pinterest"
-    if (host.includes("soundcloud.com")) return "soundcloud"
-    if (host.includes("reddit.com")) return "reddit"
-    if (host.includes("vimeo.com")) return "vimeo"
+    if (host.includes("soundcloud.com") || host.includes("reddit.com") || host.includes("redd.it") || host.includes("vimeo.com")) return "unsupported"
     return "other"
   } catch {
     return "other"
@@ -1095,13 +1482,28 @@ function isValidImageForPlatform(url, platform) {
       /image|photo|picture|media/.test(value)
   }
 
-  return /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) || /image|photo/.test(value)
+  if (platform === "pinterest") {
+    if (/pinterest\.[^/]+\/pin\//.test(value) || /pin\.it\//.test(value)) return false
+    if (/avatar|profile|emoji|icon|logo|sprite|favicon/.test(value)) return false
+    if (/video|videos|mime_type=video|\.mp4(\?|$)|\.m3u8(\?|$)/.test(value)) return false
+
+    return /pinimg/.test(value) ||
+      /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
+      /image|photo|picture|media/.test(value)
+  }
+
+  return /\.(jpg|jpeg|png|webp|avif|heic)(\?|$)/.test(value) ||
+    /image|photo|pbs\.twimg|twimg/.test(value) ||
+    (/(cdninstagram|fbcdn|scontent)/.test(value) && !/video|\.mp4|mime_type=video/.test(value))
 }
 
 function isLikelyVideoUrl(url) {
   const value = String(url || "").toLowerCase()
   if (/mime_type=audio|audio_mpeg|audio_mp4|\.mp3(\?|$)|\.m4a(\?|$)|\.ogg(\?|$)|\.wav(\?|$)|\.opus(\?|$)/.test(value)) return false
-  return /\.(mp4|webm|mov|m3u8)(\?|$)/.test(value) || /mime_type=video|playaddr|downloadaddr/.test(value)
+  if (/avatar|profile|emoji|icon|logo|sprite|glyph|favicon/.test(value)) return false
+  return /\.(mp4|webm|mov|m3u8)(\?|$)/.test(value) ||
+    /mime_type=video|video_mp4|playaddr|downloadaddr|video_versions|video_url|dash_url|\/video\//.test(value) ||
+    (/(cdninstagram|fbcdn|fbsbx|scontent|twimg)/.test(value) && /video|\.mp4|\/v\//.test(value))
 }
 
 function isLikelyAudioUrl(url) {
@@ -1119,7 +1521,8 @@ function firstClean(values) {
 
 function fallbackResult(inputUrl, reason = "fallback") {
   const platform = detectPlatform(inputUrl)
-  const kind = detectKindFromUrl(inputUrl, platform) || "video"
+  const detectedKind = detectKindFromUrl(inputUrl, platform)
+  const kind = detectedKind || (platform === "pinterest" ? "photo" : ["x", "threads"].includes(platform) ? "mixed" : "video")
   return {
     platform,
     kind,
@@ -1154,8 +1557,9 @@ function prettyPlatform(value) {
     youtube: "YouTube",
     facebook: "Facebook",
     pinterest: "Pinterest",
-    soundcloud: "SoundCloud",
+    threads: "Threads",
     x: "X/Twitter",
+    unsupported: "Unsupported",
     other: "Media"
   }
   return map[value] || String(value || "Media")
