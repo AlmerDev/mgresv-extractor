@@ -404,6 +404,7 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
     resolvedSource: sourceUrl,
     slides,
     videoUrls: unique(videoUrls).slice(0, 5),
+    audioUrls: unique(audioUrls).slice(0, 5),
     rawDebug: {
       provider: providerPayload?.provider || "unknown",
       imageCount: uniqueImages.length,
@@ -1128,6 +1129,8 @@ function fallbackResult(inputUrl, reason = "fallback") {
     originalSource: inputUrl,
     resolvedSource: inputUrl,
     slides: [],
+    videoUrls: [],
+    audioUrls: [],
     rawDebug: { mode: "provider-api-system", fallbackReason: reason },
     meta: {
       ogType: "",
