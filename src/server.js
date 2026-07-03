@@ -323,8 +323,9 @@ async function extractViaTikTokPage(url) {
     const payloads = extractTikTokJsonPayloads(html)
     const imageUrls = unique([
       ...extractTikTokPhotoImagesFromPayloads(payloads),
+      ...extractTikTokPhotoImagesFromKeyedHtml(html),
       ...extractTikTokPhotoImagesFromHtml(html)
-    ]).slice(0, 20)
+    ]).slice(0, 35)
 
     const slides = imageUrls.map((item, index) => ({
       index,
@@ -368,21 +369,53 @@ async function extractViaTikTokPage(url) {
 
 function extractTikTokJsonPayloads(html) {
   const payloads = []
+  const seen = new Set()
   const regexes = [
     /<script[^>]+id=["']__UNIVERSAL_DATA_FOR_REHYDRATION__["'][^>]*>([\s\S]*?)<\/script>/gi,
     /<script[^>]+id=["']SIGI_STATE["'][^>]*>([\s\S]*?)<\/script>/gi,
+    /<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/gi,
+    /<script[^>]+type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi,
+    /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
     /window\[['"]SIGI_STATE['"]\]\s*=\s*({[\s\S]*?})\s*;/gi,
-    /window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*({[\s\S]*?})\s*;/gi
+    /window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*({[\s\S]*?})\s*;/gi,
+    /window\[['"]SIGI_STATE['"]\]\s*=\s*JSON\.parse\((['"`])([\s\S]*?)\1\)\s*;/gi,
+    /window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*JSON\.parse\((['"`])([\s\S]*?)\1\)\s*;/gi
   ]
 
   for (const regex of regexes) {
     for (const match of html.matchAll(regex)) {
-      const parsed = safeJsonParseTikTok(match?.[1])
-      if (parsed && typeof parsed === "object") payloads.push(parsed)
+      const raw = typeof match?.[2] === "string"
+        ? decodeJsStringLiteral(match[2], match[1])
+        : match?.[1]
+      const parsed = safeJsonParseTikTok(raw)
+      const key = parsed ? JSON.stringify(parsed).slice(0, 200) : ""
+      if (parsed && typeof parsed === "object" && !seen.has(key)) {
+        seen.add(key)
+        payloads.push(parsed)
+      }
+    }
+  }
+
+  for (const match of String(html || "").matchAll(/JSON\.parse\((['"`])([\s\S]*?)\1\)/gi)) {
+    const raw = decodeJsStringLiteral(match?.[2], match?.[1])
+    const parsed = safeJsonParseTikTok(raw)
+    const key = parsed ? JSON.stringify(parsed).slice(0, 200) : ""
+    if (parsed && typeof parsed === "object" && !seen.has(key)) {
+      seen.add(key)
+      payloads.push(parsed)
     }
   }
 
   return payloads
+}
+
+function decodeJsStringLiteral(value, quote = '"') {
+  if (typeof value !== "string") return ""
+  try {
+    return JSON.parse(`${quote}${value}${quote}`)
+  } catch {
+    return value
+  }
 }
 
 function safeJsonParseTikTok(value) {
@@ -404,6 +437,21 @@ function safeJsonParseTikTok(value) {
   const assignment = clean.match(/^[^=]+=\s*({[\s\S]*})$/)
   if (assignment?.[1]) clean = assignment[1]
 
+  const assignmentJsonParse = clean.match(/^[^=]+=\s*JSON\.parse\((['"`])([\s\S]*)\1\)\s*$/)
+  if (assignmentJsonParse?.[2]) {
+    clean = decodeJsStringLiteral(assignmentJsonParse[2], assignmentJsonParse[1]).trim()
+  }
+
+  const directJsonParse = clean.match(/^JSON\.parse\((['"`])([\s\S]*)\1\)$/)
+  if (directJsonParse?.[2]) {
+    clean = decodeJsStringLiteral(directJsonParse[2], directJsonParse[1]).trim()
+  }
+
+  const quotedJson = clean.match(/^(['"`])([\s\S]*)\1$/)
+  if (quotedJson?.[2] && /^[\[{]/.test(decodeJsStringLiteral(quotedJson[2], quotedJson[1]).trim())) {
+    clean = decodeJsStringLiteral(quotedJson[2], quotedJson[1]).trim()
+  }
+
   try {
     return JSON.parse(clean)
   } catch {
@@ -413,23 +461,91 @@ function safeJsonParseTikTok(value) {
 
 function extractTikTokPhotoImagesFromPayloads(payloads) {
   const output = []
+
   for (const payload of Array.isArray(payloads) ? payloads : []) {
-    output.push(...collectTikTokPhotoImages(payload))
+    output.push(...collectTikTokPagePhotoImages(payload))
   }
+
   return unique(output)
+}
+
+function collectTikTokPagePhotoImages(node, depth = 0) {
+  const output = []
+  if (!node || depth > 7) return output
+
+  function push(value) {
+    const clean = cleanTikTokMediaUrl(value)
+    if (clean && isValidImageForPlatform(clean, "tiktok")) output.push(clean)
+  }
+
+  if (typeof node === "string") {
+    push(node)
+    return output
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) output.push(...collectTikTokPagePhotoImages(item, depth + 1))
+    return output
+  }
+
+  if (typeof node !== "object") return output
+
+  push(node.url)
+  push(node.src)
+  push(node.image)
+  push(node.imageUrl)
+  push(node.image_url)
+  push(node.displayUrl)
+  push(node.display_url)
+  push(node.downloadUrl)
+  push(node.download_url)
+
+  const arrays = [
+    node.urlList,
+    node.url_list,
+    node.urls,
+    node.images,
+    node.imageList,
+    node.image_list,
+    node.photos,
+    node.slides,
+    node.imagePost?.images,
+    node.image_post?.images,
+    node.imageURL?.urlList,
+    node.imageURL?.url_list,
+    node.imageUrl?.urlList,
+    node.image_url?.url_list,
+    node.displayImage?.urlList,
+    node.display_image?.url_list,
+    node.image?.urlList,
+    node.image?.url_list
+  ]
+
+  for (const value of arrays) {
+    if (!Array.isArray(value)) continue
+    for (const item of value) output.push(...collectTikTokPagePhotoImages(item, depth + 1))
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    if (/avatar|profile|author|owner|user|music|sound|audio|cover|dynamic|originCover|icon|logo|emoji|sticker|effect|ad|recommend|related|suggest/i.test(key)) {
+      continue
+    }
+
+    if (/imagepost|image_post|imageurl|image_url|imagelist|image_list|images|photo|photos|slide|slides|carousel|urllist|url_list/i.test(key)) {
+      output.push(...collectTikTokPagePhotoImages(value, depth + 1))
+    }
+  }
+
+  return output
 }
 
 function extractTikTokPhotoImagesFromHtml(html) {
   const output = []
-  const normalizedHtml = String(html || "")
-    .replaceAll("\\u002F", "/")
-    .replaceAll("\\u0026", "&")
-    .replaceAll("\\/", "/")
-    .replaceAll("&amp;", "&")
+  const normalizedHtml = normalizeTikTokHtml(html)
 
   const patterns = [
     /https:\/\/[^"'<>\\\s]+~tplv-photomode-image[^"'<>\\\s]+/gi,
-    /https:\/\/[^"'<>\\\s]+(?:tiktokcdn|byteimg|ibyteimg|ibytedtos|bytegecko)[^"'<>\\\s]+\.(?:jpe?g|png|webp|avif)[^"'<>\\\s]*/gi
+    /https:\/\/[^"'<>\\\s]+(?:tiktokcdn|byteimg|ibyteimg|ibytedtos|bytegecko|muscdn)[^"'<>\\\s]+\.(?:jpe?g|png|webp|avif)[^"'<>\\\s]*/gi
   ]
 
   for (const pattern of patterns) {
@@ -440,6 +556,35 @@ function extractTikTokPhotoImagesFromHtml(html) {
   }
 
   return unique(output)
+}
+
+function extractTikTokPhotoImagesFromKeyedHtml(html) {
+  const output = []
+  const normalizedHtml = normalizeTikTokHtml(html)
+  const urlPattern = /https:\/\/[^"'<>\\\s]+(?:tiktokcdn|byteimg|ibyteimg|ibytedtos|bytegecko|muscdn|snssdk|p16-|p19-|p26-|tos-)[^"'<>\\\s]*/gi
+
+  for (const match of normalizedHtml.matchAll(urlPattern)) {
+    const clean = cleanTikTokMediaUrl(match?.[0])
+    if (!clean) continue
+
+    const start = Math.max(0, (match.index || 0) - 220)
+    const end = Math.min(normalizedHtml.length, (match.index || 0) + clean.length + 220)
+    const context = normalizedHtml.slice(start, end).toLowerCase()
+
+    if (!/(image|photo|slide|carousel|display_image|displayimage|image_url|imageurl|imagepost|photomode|url_list|urllist|images)/.test(context)) continue
+    if (/(avatar|profile|author|owner|user|music|sound|audio|emoji|sticker|effect|logo|icon|video\/tos)/.test(context)) continue
+    if (isValidImageForPlatform(clean, "tiktok")) output.push(clean)
+  }
+
+  return unique(output)
+}
+
+function normalizeTikTokHtml(html) {
+  return String(html || "")
+    .replaceAll("\\u002F", "/")
+    .replaceAll("\\u0026", "&")
+    .replaceAll("\\/", "/")
+    .replaceAll("&amp;", "&")
 }
 
 function cleanTikTokMediaUrl(value) {
