@@ -107,6 +107,9 @@ async function extractProviderFirst(inputUrl) {
   }
 
   if (PROVIDER_MODE === "auto" || PROVIDER_MODE === "lite") {
+    if (platform === "tiktok" && kind !== "video") {
+      attempts.push(() => extractViaTikTokPage(resolvedUrl || inputUrl))
+    }
     attempts.push(() => extractLite(resolvedUrl || inputUrl, platform, kind))
   }
 
@@ -300,6 +303,225 @@ async function extractLite(url, platform, kind) {
     }
   }
 }
+
+
+async function extractViaTikTokPage(url) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), Math.min(MAX_FETCH_MS, 12000))
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: browserLikeHeaders(url),
+      redirect: "follow",
+      signal: controller.signal
+    })
+
+    if (!response.ok) return null
+
+    const html = await response.text()
+    const payloads = extractTikTokJsonPayloads(html)
+    const imageUrls = unique([
+      ...extractTikTokPhotoImagesFromPayloads(payloads),
+      ...extractTikTokPhotoImagesFromHtml(html)
+    ]).slice(0, 20)
+
+    const slides = imageUrls.map((item, index) => ({
+      index,
+      type: "photo",
+      url: item,
+      thumbnail: item,
+      filename: `tiktok-${index + 1}.${guessImageExt(item)}`
+    }))
+
+    const title =
+      pickMetaContent(html, "og:title") ||
+      findFirstMatchingValue(payloads, /(^|\.)(desc|title|pageTitle|seoTitle)$/i, true) ||
+      "TikTok photo/slide media"
+
+    const thumbnail =
+      slides[0]?.thumbnail ||
+      pickMetaContent(html, "og:image") ||
+      pickMetaContent(html, "twitter:image") ||
+      findFirstMatchingValue(payloads, /thumbnail|cover|dynamiccover|dynamic_cover/i, false) ||
+      ""
+
+    if (!slides.length && !thumbnail) return null
+
+    return {
+      provider: "tiktok-page",
+      data: {
+        title,
+        thumbnail,
+        slides,
+        videoUrls: [],
+        kind: "photo",
+        platform: "tiktok"
+      }
+    }
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function extractTikTokJsonPayloads(html) {
+  const payloads = []
+  const regexes = [
+    /<script[^>]+id=["']__UNIVERSAL_DATA_FOR_REHYDRATION__["'][^>]*>([\s\S]*?)<\/script>/gi,
+    /<script[^>]+id=["']SIGI_STATE["'][^>]*>([\s\S]*?)<\/script>/gi,
+    /window\[['"]SIGI_STATE['"]\]\s*=\s*({[\s\S]*?})\s*;/gi,
+    /window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*({[\s\S]*?})\s*;/gi
+  ]
+
+  for (const regex of regexes) {
+    for (const match of html.matchAll(regex)) {
+      const parsed = safeJsonParseTikTok(match?.[1])
+      if (parsed && typeof parsed === "object") payloads.push(parsed)
+    }
+  }
+
+  return payloads
+}
+
+function safeJsonParseTikTok(value) {
+  if (!value) return null
+
+  let clean = String(value).trim()
+  clean = clean
+    .replace(/^[\s;]+|[\s;]+$/g, "")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#34;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("\\u002F", "/")
+    .replaceAll("\\u0026", "&")
+    .replaceAll("\\/", "/")
+
+  const assignment = clean.match(/^[^=]+=\s*({[\s\S]*})$/)
+  if (assignment?.[1]) clean = assignment[1]
+
+  try {
+    return JSON.parse(clean)
+  } catch {
+    return null
+  }
+}
+
+function extractTikTokPhotoImagesFromPayloads(payloads) {
+  const output = []
+  for (const payload of Array.isArray(payloads) ? payloads : []) {
+    output.push(...collectTikTokPhotoImages(payload))
+  }
+  return unique(output)
+}
+
+function extractTikTokPhotoImagesFromHtml(html) {
+  const output = []
+  const normalizedHtml = String(html || "")
+    .replaceAll("\\u002F", "/")
+    .replaceAll("\\u0026", "&")
+    .replaceAll("\\/", "/")
+    .replaceAll("&amp;", "&")
+
+  const patterns = [
+    /https:\/\/[^"'<>\\\s]+~tplv-photomode-image[^"'<>\\\s]+/gi,
+    /https:\/\/[^"'<>\\\s]+(?:tiktokcdn|byteimg|ibyteimg|ibytedtos|bytegecko)[^"'<>\\\s]+\.(?:jpe?g|png|webp|avif)[^"'<>\\\s]*/gi
+  ]
+
+  for (const pattern of patterns) {
+    for (const match of normalizedHtml.matchAll(pattern)) {
+      const clean = cleanTikTokMediaUrl(match?.[0])
+      if (clean && isValidImageForPlatform(clean, "tiktok")) output.push(clean)
+    }
+  }
+
+  return unique(output)
+}
+
+function cleanTikTokMediaUrl(value) {
+  const clean = String(value || "")
+    .trim()
+    .replaceAll("\\u002F", "/")
+    .replaceAll("\\u0026", "&")
+    .replaceAll("\\/", "/")
+    .replaceAll("&amp;", "&")
+    .replace(/^"(.*)"$/, "$1")
+
+  if (!clean) return ""
+  return clean
+}
+
+function pickMetaContent(html, name) {
+  const regex = new RegExp(`<meta[^>]+(?:property|name)=["']${escapeRegex(name)}["'][^>]+content=["']([^"']+)["'][^>]*>`, "i")
+  const match = String(html || "").match(regex)
+  return match?.[1]
+    ? match[1]
+        .replaceAll("&amp;", "&")
+        .replaceAll("&#39;", "'")
+        .trim()
+    : ""
+}
+
+function findFirstMatchingValue(node, keyPattern, wantsString = false, depth = 0) {
+  if (!node || depth > 7) return ""
+
+  if (typeof node === "string") {
+    const clean = wantsString ? node.trim() : cleanTikTokMediaUrl(node)
+    return clean || ""
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findFirstMatchingValue(item, keyPattern, wantsString, depth + 1)
+      if (found) return found
+    }
+    return ""
+  }
+
+  if (typeof node !== "object") return ""
+
+  const payloads = Array.isArray(node) ? node : [node]
+
+  for (const current of payloads) {
+    for (const [key, value] of Object.entries(current)) {
+      if (!keyPattern.test(String(key))) {
+        if (typeof value === "object") {
+          const nested = findFirstMatchingValue(value, keyPattern, wantsString, depth + 1)
+          if (nested) return nested
+        }
+        continue
+      }
+
+      if (typeof value === "string") {
+        const clean = wantsString ? value.trim() : cleanTikTokMediaUrl(value)
+        if (clean) return clean
+      }
+
+      const nested = findFirstMatchingValue(value, keyPattern, wantsString, depth + 1)
+      if (nested) return nested
+    }
+  }
+
+  return ""
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function browserLikeHeaders(referer) {
+  return {
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+    "accept-language": "en-US,en;q=0.9,id;q=0.8",
+    referer,
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+  }
+}
+
 
 function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) {
   const raw = providerPayload?.data ?? providerPayload ?? {}
@@ -1386,6 +1608,7 @@ function detectKindFromUrl(value, platform) {
     const path = parsed.pathname.toLowerCase()
     const host = parsed.hostname.toLowerCase()
 
+    // TikTok image validation now supports additional CDN domains such as ibytedtos, ibyteimg, bytegd, etc.
     if (platform === "tiktok") {
       if (path.includes("/photo/")) return "photo"
       if (path.includes("/video/")) return "video"
@@ -1457,11 +1680,11 @@ function isValidImageForPlatform(url, platform) {
   if (/\/video\/tos\//.test(value)) return false
 
   if (platform === "tiktok") {
-    if (!/(tiktokcdn|muscdn|byteimg)/.test(value)) return false
+    if (!/(tiktokcdn|muscdn|byteimg|ibytedtos|ibyteimg|bytegecko|bytegd|tiktokv)/.test(value)) return false
     if (/avatar|profile|emoji|icon|logo|tos-maliva-avt/.test(value)) return false
 
     // TikTok photo-mode images usually contain these markers.
-    return /photomode|tplv-photomode|image|\.jpg(\?|$)|\.jpeg(\?|$)|\.png(\?|$)|\.webp(\?|$)|\.avif(\?|$)/.test(value)
+    return /photomode|tplv-photomode|image|tos-|\.jpg(\?|$)|\.jpeg(\?|$)|\.png(\?|$)|\.webp(\?|$)|\.avif(\?|$)/.test(value)
   }
 
   if (platform === "instagram") {
