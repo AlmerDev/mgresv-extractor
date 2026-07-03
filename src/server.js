@@ -99,6 +99,10 @@ async function extractProviderFirst(inputUrl) {
 
   const attempts = []
 
+  if (platform === "tiktok" && (kind === "photo" || detectedKind === "photo")) {
+    attempts.push(() => extractViaTikwm(resolvedUrl || inputUrl, platform, kind))
+  }
+
   if (PROVIDER_MODE === "auto" || PROVIDER_MODE === "rapidapi") {
     attempts.push(() => extractViaRapidApi(resolvedUrl || inputUrl, platform, kind))
   }
@@ -133,6 +137,43 @@ async function extractProviderFirst(inputUrl) {
   fallback.rawDebug.errors = errors
   return fallback
 }
+
+
+async function extractViaTikwm(url, platform, kind) {
+  if (platform !== "tiktok") return null
+
+  const endpoints = [
+    `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`,
+    `https://tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`,
+    `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`,
+    `https://tikwm.com/api/?url=${encodeURIComponent(url)}`
+  ]
+
+  for (const endpoint of endpoints) {
+    try {
+      const data = await fetchJson(endpoint, {
+        ...browserHeaders("https://www.tikwm.com/"),
+        accept: "application/json,text/plain,*/*",
+        referer: "https://www.tikwm.com/"
+      }, { timeoutMs: 15000 })
+
+      const payload = data?.data || data
+      const normalized = normalizeProviderData({ provider: "tikwm", data: payload }, url, "tiktok", "photo")
+
+      if (normalized?.slides?.length || normalized?.thumbnail) {
+        return {
+          provider: "tikwm",
+          data: payload
+        }
+      }
+    } catch {
+      // Try the next endpoint.
+    }
+  }
+
+  return null
+}
+
 
 async function extractViaRapidApi(url, platform, kind) {
   if (!RAPIDAPI_KEY) return null
@@ -242,6 +283,7 @@ function buildApifyInputCandidates(url, platform) {
     }
 
     return [
+      { urls: [url], postURLs: [url], shouldDownloadSlideshowImages: true },
       directPostInput,
       { ...directPostInput, proxyCountryCode: "ID" },
       { postURLs: [url], resultsPerPage: 1, shouldDownloadVideos: false, shouldDownloadCovers: true, shouldDownloadSlideshowImages: true },
@@ -651,11 +693,6 @@ function pickMetaContent(html, name) {
 function findFirstMatchingValue(node, keyPattern, wantsString = false, depth = 0) {
   if (!node || depth > 7) return ""
 
-  if (typeof node === "string") {
-    const clean = wantsString ? node.trim() : cleanTikTokMediaUrl(node)
-    return clean || ""
-  }
-
   if (Array.isArray(node)) {
     for (const item of node) {
       const found = findFirstMatchingValue(item, keyPattern, wantsString, depth + 1)
@@ -666,25 +703,41 @@ function findFirstMatchingValue(node, keyPattern, wantsString = false, depth = 0
 
   if (typeof node !== "object") return ""
 
-  const payloads = Array.isArray(node) ? node : [node]
+  for (const [key, value] of Object.entries(node)) {
+    if (keyPattern.test(String(key))) {
+      const direct = pickMatchedValue(value, wantsString, depth + 1)
+      if (direct) return direct
+    }
 
-  for (const current of payloads) {
-    for (const [key, value] of Object.entries(current)) {
-      if (!keyPattern.test(String(key))) {
-        if (typeof value === "object") {
-          const nested = findFirstMatchingValue(value, keyPattern, wantsString, depth + 1)
-          if (nested) return nested
-        }
-        continue
-      }
-
-      if (typeof value === "string") {
-        const clean = wantsString ? value.trim() : cleanTikTokMediaUrl(value)
-        if (clean) return clean
-      }
-
+    if (value && typeof value === "object") {
       const nested = findFirstMatchingValue(value, keyPattern, wantsString, depth + 1)
       if (nested) return nested
+    }
+  }
+
+  return ""
+}
+
+function pickMatchedValue(value, wantsString = false, depth = 0) {
+  if (!value || depth > 7) return ""
+
+  if (typeof value === "string") {
+    const clean = wantsString ? value.trim() : cleanTikTokMediaUrl(value)
+    return clean || ""
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = pickMatchedValue(item, wantsString, depth + 1)
+      if (found) return found
+    }
+    return ""
+  }
+
+  if (typeof value === "object") {
+    for (const childValue of Object.values(value)) {
+      const found = pickMatchedValue(childValue, wantsString, depth + 1)
+      if (found) return found
     }
   }
 
@@ -713,7 +766,7 @@ function normalizeProviderData(providerPayload, sourceUrl, platform, knownKind) 
   const socialExplicitImages = socialExplicitMedia.imageUrls || []
   const tiktokPhotoMode = platform === "tiktok" && knownKind === "photo"
   const tiktokExplicitImages = tiktokPhotoMode ? extractTikTokPhotoImages(raw) : []
-  const title = pickTitle(raw) || defaultTitle(platform, knownKind)
+  const title = sanitizeDisplayTitle(pickTitle(raw), platform, knownKind)
   const allUrls = []
   const imageUrls = []
   const videoUrls = []
@@ -1604,8 +1657,8 @@ function walkAny(node, onString, key = "") {
 function pickTitle(raw) {
   const items = flattenItems(raw)
   for (const item of items) {
-    const value = item?.title || item?.caption || item?.desc || item?.description || item?.text || item?.shortcode
-    if (typeof value === "string" && value.trim()) return cleanTitle(value)
+    const value = item?.title || item?.caption || item?.desc || item?.description || item?.text || item?.video_description || item?.videoDescription || item?.itemStruct?.desc || item?.aweme_detail?.desc || item?.shortcode
+    if (typeof value === "string" && value.trim() && !isBadMediaTitle(value)) return cleanTitle(value)
   }
   return ""
 }
@@ -1920,12 +1973,14 @@ function isValidImageForPlatform(url, platform) {
 
   if (platform === "tiktok") {
     if (isSocialPostPageUrl(value)) return false
+    if (isTikTokNonMediaHost(value)) return false
     if (/api\.apify\.com\/v2\/key-value-stores\/[^/]+\/records\//.test(value)) return true
-    if (!/(tiktokcdn|muscdn|byteimg|ibytedtos|ibyteimg|bytegecko|bytegd|tiktokv)/.test(value)) return false
-    if (/avatar|profile|emoji|icon|logo|tos-maliva-avt/.test(value)) return false
+    if (/tikwm\.com\/.+\/(?:cover|image|photo|media)\//.test(value) && !/\.mp4(\?|$)|video\/media\/play/.test(value)) return true
+    if (!/(tiktokcdn|muscdn|byteimg|ibytedtos|ibyteimg|bytegecko|bytegd|tiktokv|p16-|p19-|p26-|p9-|p77-)/.test(value)) return false
+    if (/avatar|profile|emoji|icon|logo|tos-maliva-avt|message\/send/.test(value)) return false
 
     // TikTok photo-mode images usually contain these markers.
-    return /photomode|tplv-photomode|image|tos-|\.jpg(\?|$)|\.jpeg(\?|$)|\.png(\?|$)|\.webp(\?|$)|\.avif(\?|$)/.test(value)
+    return /photomode|tplv-photomode|image|tos-|\.jpg(\?|$)|\.jpeg(\?|$)|\.png(\?|$)|\.webp(\?|$)|\.avif(\?|$)|\.heic(\?|$)/.test(value)
   }
 
   if (platform === "instagram") {
@@ -1982,6 +2037,37 @@ function firstClean(values) {
   }
   return ""
 }
+
+
+function sanitizeDisplayTitle(value, platform = "media", kind = "media") {
+  const title = cleanTitle(value)
+  if (isBadMediaTitle(title)) return defaultTitle(platform, kind)
+  return title
+}
+
+function isBadMediaTitle(value) {
+  const title = String(value || "").trim()
+  if (!title) return true
+  if (title.startsWith("/") || title.startsWith("http://") || title.startsWith("https://")) return true
+  if (/\/v\d+\/message\/send/i.test(title) || /message\/send/i.test(title)) return true
+  if (/^(api|endpoint|undefined|null|object object)$/i.test(title)) return true
+  return false
+}
+
+function isTikTokNonMediaHost(value) {
+  try {
+    const parsed = new URL(String(value || ""))
+    const host = parsed.hostname.toLowerCase()
+
+    if (!host.includes("tiktok.com")) return false
+    if (host.includes("tiktokcdn") || host.includes("muscdn") || host.includes("tiktokv")) return false
+
+    return true
+  } catch {
+    return false
+  }
+}
+
 
 function fallbackResult(inputUrl, reason = "fallback") {
   const platform = detectPlatform(inputUrl)
