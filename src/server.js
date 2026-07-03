@@ -11,6 +11,7 @@ const PROVIDER_MODE = String(process.env.PROVIDER_MODE || "auto").toLowerCase()
 
 const APIFY_TOKEN = process.env.APIFY_TOKEN || ""
 const APIFY_TIKTOK_ACTOR = process.env.APIFY_TIKTOK_ACTOR || "clockworks/tiktok-scraper"
+const APIFY_TIKTOK_ACTOR_BACKUP = process.env.APIFY_TIKTOK_ACTOR_BACKUP || "clockworks/tiktok-video-scraper,apidojo/tiktok-scraper"
 const APIFY_INSTAGRAM_ACTOR = process.env.APIFY_INSTAGRAM_ACTOR || "apify/instagram-api-scraper"
 const APIFY_FACEBOOK_ACTOR = process.env.APIFY_FACEBOOK_ACTOR || ""
 const APIFY_X_ACTOR = process.env.APIFY_X_ACTOR || "apidojo/tweet-scraper"
@@ -172,54 +173,82 @@ async function extractViaRapidApi(url, platform, kind) {
 async function extractViaApify(url, platform, kind) {
   if (!APIFY_TOKEN) return null
 
-  let actor = ""
-
-  if (platform === "tiktok") actor = APIFY_TIKTOK_ACTOR
-  if (platform === "instagram") actor = APIFY_INSTAGRAM_ACTOR
-  if (platform === "facebook") actor = APIFY_FACEBOOK_ACTOR
-  if (platform === "x") actor = APIFY_X_ACTOR
-  if (platform === "threads") actor = APIFY_THREADS_ACTOR
-  if (platform === "pinterest") actor = APIFY_PINTEREST_ACTOR
-
-  if (!actor) return null
-
-  const actorId = actor.replace("/", "~")
+  const actors = getApifyActorsForPlatform(platform)
+  if (!actors.length) return null
 
   const inputs = buildApifyInputCandidates(url, platform)
 
-  for (const input of inputs) {
-    const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}&timeout=${APIFY_TIMEOUT_SECS}&memory=1024`
+  for (const actor of actors) {
+    const actorId = actor.replace("/", "~")
 
-    try {
-      const items = await fetchJson(endpoint, {
-        "content-type": "application/json"
-      }, {
-        method: "POST",
-        body: JSON.stringify(input),
-        timeoutMs: (APIFY_TIMEOUT_SECS + 10) * 1000
-      })
+    for (const input of inputs) {
+      const endpoint = `https://api.apify.com/v2/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}&timeout=${APIFY_TIMEOUT_SECS}&memory=1024`
 
-      if (Array.isArray(items) && items.length) {
-        return {
-          provider: "apify",
-          input,
-          data: items
+      try {
+        const items = await fetchJson(endpoint, {
+          "content-type": "application/json"
+        }, {
+          method: "POST",
+          body: JSON.stringify(input),
+          timeoutMs: (APIFY_TIMEOUT_SECS + 10) * 1000
+        })
+
+        if (Array.isArray(items) && items.length) {
+          return {
+            provider: "apify",
+            actor,
+            input,
+            data: items
+          }
         }
+      } catch {
+        // try next actor/input shape
       }
-    } catch {
-      // try next input shape
     }
   }
 
   return null
 }
 
+function getApifyActorsForPlatform(platform) {
+  const actorMap = {
+    tiktok: [APIFY_TIKTOK_ACTOR, APIFY_TIKTOK_ACTOR_BACKUP],
+    instagram: [APIFY_INSTAGRAM_ACTOR],
+    facebook: [APIFY_FACEBOOK_ACTOR],
+    x: [APIFY_X_ACTOR],
+    threads: [APIFY_THREADS_ACTOR],
+    pinterest: [APIFY_PINTEREST_ACTOR]
+  }
+
+  return unique(String((actorMap[platform] || []).filter(Boolean).join(","))
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean))
+}
+
 function buildApifyInputCandidates(url, platform) {
   if (platform === "tiktok") {
+    const directPostInput = {
+      postURLs: [url],
+      resultsPerPage: 1,
+      scrapeRelatedVideos: false,
+      shouldDownloadVideos: false,
+      shouldDownloadCovers: true,
+      shouldDownloadSlideshowImages: true,
+      shouldDownloadAvatars: false,
+      shouldDownloadMusicCovers: false,
+      commentsPerPost: 0,
+      proxyCountryCode: "None"
+    }
+
     return [
-      { postURLs: [url], resultsPerPage: 1, shouldDownloadVideos: false, shouldDownloadCovers: false },
-      { startUrls: [{ url }], resultsPerPage: 1, shouldDownloadVideos: false, shouldDownloadCovers: false },
-      { urls: [url], resultsLimit: 1 }
+      directPostInput,
+      { ...directPostInput, proxyCountryCode: "ID" },
+      { postURLs: [url], resultsPerPage: 1, shouldDownloadVideos: false, shouldDownloadCovers: true, shouldDownloadSlideshowImages: true },
+      { startUrls: [{ url }], resultsPerPage: 1, shouldDownloadVideos: false, shouldDownloadCovers: true, shouldDownloadSlideshowImages: true },
+      { urls: [url], resultsLimit: 1, shouldDownloadSlideshowImages: true },
+      { videoUrls: [url], maxItems: 1, shouldDownloadSlideshowImages: true },
+      { url, maxItems: 1, shouldDownloadSlideshowImages: true }
     ]
   }
 
@@ -504,6 +533,14 @@ function collectTikTokPagePhotoImages(node, depth = 0) {
     node.urlList,
     node.url_list,
     node.urls,
+    node.mediaUrls,
+    node.media_urls,
+    node.downloadUrls,
+    node.download_urls,
+    node.slideshowImageUrls,
+    node.slideshow_image_urls,
+    node.slideshowImages,
+    node.slideshow_images,
     node.images,
     node.imageList,
     node.image_list,
@@ -531,7 +568,7 @@ function collectTikTokPagePhotoImages(node, depth = 0) {
       continue
     }
 
-    if (/imagepost|image_post|imageurl|image_url|imagelist|image_list|images|photo|photos|slide|slides|carousel|urllist|url_list/i.test(key)) {
+    if (/imagepost|image_post|imageurl|image_url|imagelist|image_list|images|photo|photos|slide|slides|slideshow|carousel|mediaurls|media_urls|downloadurls|download_urls|urllist|url_list/i.test(key)) {
       output.push(...collectTikTokPagePhotoImages(value, depth + 1))
     }
   }
@@ -843,8 +880,18 @@ function extractTikTokPhotoImages(raw) {
     imagePost?.image_list,
     itemStruct?.imagePost?.images,
     itemStruct?.image_post?.images,
+    first.mediaUrls,
+    first.media_urls,
+    first.downloadUrls,
+    first.download_urls,
     first.slideshowImageUrls,
     first.slideshow_image_urls,
+    first.slideshowImages,
+    first.slideshow_images,
+    first.slideshowImageDownloadUrls,
+    first.slideshow_image_download_urls,
+    first.downloadedSlideshowImages,
+    first.downloaded_slideshow_images,
     first.carouselImages,
     first.carousel_images,
     first.photoUrls,
@@ -899,6 +946,16 @@ function collectTikTokPhotoImages(node, depth = 0) {
     node.urlList,
     node.url_list,
     node.urls,
+    node.mediaUrls,
+    node.media_urls,
+    node.downloadUrls,
+    node.download_urls,
+    node.slideshowImageUrls,
+    node.slideshow_image_urls,
+    node.slideshowImages,
+    node.slideshow_images,
+    node.slideshowImageDownloadUrls,
+    node.slideshow_image_download_urls,
     node.imageURL?.urlList,
     node.imageURL?.url_list,
     node.imageUrl?.urlList,
@@ -918,7 +975,7 @@ function collectTikTokPhotoImages(node, depth = 0) {
     // Keep this walker strict. TikTok provider payloads often contain covers,
     // author avatars, stickers, music thumbnails, and recommended/related images.
     if (/avatar|profile|author|owner|user|music|sound|audio|cover|dynamic|origin|icon|logo|emoji|sticker|effect|ad|recommend|related|suggest/i.test(key)) continue
-    if (/imagepost|image_post|imageurl|image_url|imagelist|image_list|images|photo|photos|slide|slides|carousel|urlList|url_list/i.test(key)) {
+    if (/imagepost|image_post|imageurl|image_url|imagelist|image_list|images|photo|photos|slide|slides|slideshow|carousel|mediaurls|media_urls|downloadurls|download_urls|urlList|url_list/i.test(key)) {
       output.push(...collectTikTokPhotoImages(value, depth + 1))
     }
   }
@@ -1815,6 +1872,43 @@ function isSafeProviderImageUrl(url) {
 }
 
 
+function isSocialPostPageUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""))
+    const host = parsed.hostname.toLowerCase()
+    const path = parsed.pathname.toLowerCase()
+
+    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
+      return path.includes("/@") ||
+        path.includes("/photo/") ||
+        path.includes("/video/") ||
+        path.includes("/embed/") ||
+        path.includes("/music/") ||
+        path.includes("/tag/")
+    }
+
+    if (host === "instagram.com" || host.endsWith(".instagram.com")) {
+      return /^\/(p|reel|reels|tv|stories)\//.test(path)
+    }
+
+    if (host === "facebook.com" || host.endsWith(".facebook.com") || host === "fb.watch") {
+      return /\/(watch|videos|photo|posts|permalink|story\.php|share)\b/.test(path) || host === "fb.watch"
+    }
+
+    if (host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com")) {
+      return /\/status\//.test(path)
+    }
+
+    if (host === "pin.it" || host.endsWith(".pinterest.com") || host.includes("pinterest.")) {
+      return host === "pin.it" || /\/pin\//.test(path)
+    }
+
+    return false
+  } catch {
+    return false
+  }
+}
+
 function isValidImageForPlatform(url, platform) {
   const value = String(url || "").toLowerCase()
   if (!value.startsWith("http")) return false
@@ -1825,6 +1919,8 @@ function isValidImageForPlatform(url, platform) {
   if (/\/video\/tos\//.test(value)) return false
 
   if (platform === "tiktok") {
+    if (isSocialPostPageUrl(value)) return false
+    if (/api\.apify\.com\/v2\/key-value-stores\/[^/]+\/records\//.test(value)) return true
     if (!/(tiktokcdn|muscdn|byteimg|ibytedtos|ibyteimg|bytegecko|bytegd|tiktokv)/.test(value)) return false
     if (/avatar|profile|emoji|icon|logo|tos-maliva-avt/.test(value)) return false
 
